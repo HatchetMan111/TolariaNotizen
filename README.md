@@ -267,8 +267,12 @@ In dieser Umgebung wurde **kein echter Proxmox-Host** ausgeführt. Validiert wur
 - systemd-Unit (soweit ohne `tolaria`-User/Pfade auf dem Testhost möglich)
 - Installer `--dry-run`, `--help` und Secret-Redaction
 - 44 statische Checks (`tests/static-checks.sh`: alle bestanden)
+- Realer Build-Test mit Upstream `main`: `pnpm install --frozen-lockfile` (pnpm 10.33.0, Node 22) und `pnpm build:web` erfolgreich
+- HTML-Injection gegen den echten Web-Build (`index.html` und `apps/web/collab.html`)
+- Lokaler Server-E2E-Test mit dem echten `demo-vault-v2`: `/healthz`, `/v1/vault`, `/v1/entries`, Datei-Lesen/Schreiben/Löschen, Git-Push ins bare Repo
+- Web-Config-Injection vor dem App-Bundle im echten Build geprüft
 
-Der Build (`pnpm install` + `pnpm build:web`) und der Container-Reboot wurden hier **nicht** ausgeführt. Führe auf einem Proxmox-Host aus:
+Der Container-Reboot wurde hier **nicht** ausgeführt. Führe auf einem Proxmox-Host aus:
 
 ```bash
 bash tests/static-checks.sh
