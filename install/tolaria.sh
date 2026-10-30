@@ -424,17 +424,17 @@ fi
 # Secrets: bei Re-Run bestehende übernehmen, sonst neu erzeugen
 # ---------------------------------------------------------------------------
 read_existing_token() {
-  pct exec "$CTID" -- bash -lc \
+  pct exec "$CTID" -- bash -c \
     'if [ -f /etc/tolaria/tolaria.env ]; then . /etc/tolaria/tolaria.env; printf "%s" "${TOLARIA_SERVER_TOKEN:-}"; fi' \
     2>/dev/null || true
 }
 read_existing_auth_user() {
-  pct exec "$CTID" -- bash -lc \
+  pct exec "$CTID" -- bash -c \
     'if [ -f /root/tolaria-credentials.txt ]; then sed -n "s/^USER=//p" /root/tolaria-credentials.txt | head -n1; fi' \
     2>/dev/null || true
 }
 read_existing_auth_pass() {
-  pct exec "$CTID" -- bash -lc \
+  pct exec "$CTID" -- bash -c \
     'if [ -f /root/tolaria-credentials.txt ]; then sed -n "s/^PASSWORD=//p" /root/tolaria-credentials.txt | head -n1; fi' \
     2>/dev/null || true
 }

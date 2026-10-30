@@ -107,7 +107,7 @@ if [[ -n "$IP" ]]; then
     fail "Basic-Auth-Zugangsdaten nicht lesbar (/root/tolaria-credentials.txt)"
   fi
 
-  TOKEN="$(pct exec "$CTID" -- bash -lc 'sed -n "s/^TOLARIA_SERVER_TOKEN=//p" /etc/tolaria/tolaria.env | head -n1' 2>/dev/null || true)"
+  TOKEN="$(pct exec "$CTID" -- bash -c 'sed -n "s/^TOLARIA_SERVER_TOKEN=//p" /etc/tolaria/tolaria.env | head -n1' 2>/dev/null || true)"
   if [[ -n "$TOKEN" ]]; then
     if curl -fsS --max-time 10 -H "Authorization: Bearer ${TOKEN}" "http://${IP}:${PORT}/v1/vault" >/dev/null; then
       pass "GET /v1/vault mit Bearer-Token nach Reboot"
