@@ -1,0 +1,280 @@
+# Tolaria auf Proxmox VE
+
+Ein Community-Scripts-artiger Einzeiler, der **Tolaria** (lokale Markdown-Wissensbasis / Second Brain) in einem unprivilegierten Debian-12-LXC auf Proxmox VE installiert.
+
+> **Alpha-Hinweis:** Der Web-Build von Tolaria ist Upstream noch **Alpha**. Der Desktop-Build ist das primäre Produkt. Dieses Projekt macht den Web-/Sync-Stack für ein Einzelvault im LAN nutzbar, nicht für Mehrbenutzer-Hosting im Internet.
+
+> **Sicherheitsgrenze:** Die Web-UI läuft standardmäßig über **HTTP** (Port 8080). Basic-Auth-Passwort und Bearer-Token gehen dabei unverschlüsselt über das Netz. Nur in einem vertrauenswürdigen LAN oder hinter VPN/TLS-Reverse-Proxy betreiben. Basic-Auth-Benutzer und -Passwort sind Einzelbenutzer-Zugang: Wer sie hat, sieht auch das Bearer-Token in `/tolaria-config.js` und hat vollen Vault-Zugriff.
+
+## Einzeiler
+
+Auf dem **Proxmox-Host** als root:
+
+```bash
+bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/TolariaNotizen/main/install/tolaria.sh)"
+```
+
+Alternativ mit festen Ressourcen / CT-ID:
+
+```bash
+CT_ID=150 CORES=4 RAM=6144 DISK=12 \
+  bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/TolariaNotizen/main/install/tolaria.sh)"
+```
+
+Oder lokal:
+
+```bash
+bash install/tolaria.sh --ctid 150 --cores 4 --memory 6144 --disk 12
+```
+
+## Was installiert wird
+
+| Komponente | Details |
+|---|---|
+| Container | Debian 12, unprivilegiert, `onboot=1`, Hostname `tolaria` |
+| Ressourcen | 4 vCPU, 6144 MB RAM, 4096 MB Swap, 12 GB Disk (änderbar) |
+| App | Tolaria Web-Build aus `refactoringhq/tolaria` (`pnpm build:web`) |
+| Server | Tolaria-Sync-Server (Node 22.14+, Port `127.0.0.1:8787`) |
+| Vault | bare Git-Repo `/var/lib/tolaria/vault.git`, geseedet mit `demo-vault-v2` |
+| Daten | `/var/lib/tolaria/data` (Arbeits-Clone, Index, Snapshots) |
+| Service | `tolaria.service` (systemd, `Restart=always`) |
+| Proxy | nginx auf Port `8080`, Basic Auth für UI und Web-Config |
+| Secrets | `/etc/tolaria/tolaria.env` (root-only), `/root/tolaria-credentials.txt` |
+
+Der Installer ist **idempotent**: Ein erneuter Lauf mit derselben CT-ID aktualisiert den Quellcode und rebuildet, ohne den Vault zu überschreiben. Vorhandene Tokens und Basic-Auth-Zugangsdaten werden wiederverwendet.
+
+## Zugriff
+
+Nach der Installation zeigt der Installer URL und Zugangsdaten an. Standard:
+
+```text
+URL:      http://<LXC-IP>:8080
+Benutzer: tolaria
+Passwort: <zufällig, siehe Ausgabe>
+```
+
+Die Zugangsdaten liegen zusätzlich im Container unter `/root/tolaria-credentials.txt`:
+
+```bash
+pct exec <CTID> -- cat /root/tolaria-credentials.txt
+```
+
+Der API-Token liegt in `/etc/tolaria/tolaria.env` (root-only). Er wird nicht im Klartext geloggt.
+
+### Auth-Modell (wichtig)
+
+Tolaria Web sendet an `/v1/*` immer einen `Authorization: Bearer <token>`-Header. Deshalb gilt:
+
+- `/` und `/tolaria-config.js` sind mit **HTTP Basic Auth** geschützt.
+- `/v1/*` ist **nicht** Basic-geschützt; dort prüft der Tolaria-Server das Bearer-Token.
+- Das echte Token steht in `/tolaria-config.js`. Diese Datei ist nur nach Basic-Auth erreichbar, aber für jeden authentifizierten Browser sichtbar.
+- Der Server selbst lauscht nur auf `127.0.0.1:8787` und ist nicht direkt erreichbar.
+- Das ist ein Einzelbenutzer-Setup. Es gibt keine Rollen, keine getrennten Konten und keine Mandantentrennung.
+
+Basic Auth auf `/v1/*` wäre technisch falsch: Der Client überschreibt den `Authorization`-Header mit `Bearer`, und WebSocket-Upgrades können keinen Basic-Header zuverlässig mitschicken. Für Internet-Betrieb gehört zusätzlich ein VPN oder ein SSO-/Access-Proxy davor.
+
+## Grenzen
+
+- **Kein Desktop-Sync-Endpunkt:** Der Server arbeitet mit einem lokalen bare Git-Repo. Die Tolaria-Desktop-App kann dieses Repo nicht direkt als Git-Remote nutzen; für Desktop-Sync müsste das bare Repo zusätzlich per SSH/HTTPS als Git-Remote exponiert werden. Dieses Installer-Setup liefert bewusst nur die Web-UI.
+- **Kein TLS:** Standard ist HTTP im LAN. Für Zugriff aus anderen Netzen VPN oder einen TLS-terminierenden Reverse-Proxy davorschalten.
+- **Alpha:** Upstream-Web-Build und Protokoll können sich ändern; ein Update kann Anpassungen erfordern.
+- **Ein Vault:** Die Installation ist auf ein Vault und einen Benutzer ausgelegt.
+
+## Voraussetzungen
+
+- Proxmox VE 8.x (getestet werden konnte nur statisch, siehe unten)
+- Root-Zugriff auf den Proxmox-Host
+- Internetzugang für Template, NodeSource, npm/pnpm und den Upstream-Build
+- Mindestens 12 GB freier Storage, 6 GB RAM und 4 vCPU für den Build
+- Port `8080` im LAN erreichbar (oder `--port` ändern)
+
+## Optionen
+
+```text
+--ctid ID            Container-ID (Default: nächste freie ID)
+--hostname NAME      Hostname (Default: tolaria)
+--cores N            vCPU (Default: 4)
+--memory MB          RAM in MB (Default: 6144)
+--swap MB            Swap in MB (Default: 4096)
+--disk GB            Disk in GB (Default: 12)
+--storage NAME       RootFS-Storage (Default: auto, bevorzugt local-lvm)
+--template-store N   Template-Storage (Default: local)
+--bridge NAME        Netzwerk-Bridge (Default: vmbr0)
+--port PORT          Web-UI-Port (Default: 8080)
+--auth-user USER     Basic-Auth-Benutzer (Default: tolaria)
+--auth-password PW   Basic-Auth-Passwort (Default: zufällig)
+--ref REF            Upstream-Branch/Tag (Default: main)
+--password PW        Root-Passwort des Containers (Default: zufällig)
+--ssh-key PATH       SSH-Public-Key in den Container übernehmen
+--debug, -x          Trace bis zur Secret-Erzeugung + erweiterte Fehlerkette
+--dry-run            Nur Plan ausgeben, nichts verändern
+--help, -h           Hilfe
+```
+
+Umgebungsvariablen funktionieren ebenfalls, z. B. `CT_ID`, `CORES`, `RAM`, `SWAP`, `DISK`, `BRIDGE`, `PORT`, `TOLARIA_REF`.
+
+`--auth-password` erlaubt nur `A-Z a-z 0-9 . _ ~ @ % + = : , / -`. Ohne Angabe wird ein zufälliges Hex-Passwort erzeugt. `--debug` pausiert den Trace bewusst vor der Secret-Erzeugung, damit Token/Passwörter nicht im Install-Log landen.
+
+## Update
+
+Einfach den Einzeiler erneut ausführen. Der bestehende Container wird erkannt und wiederverwendet:
+
+```bash
+bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/TolariaNotizen/main/install/tolaria.sh)"
+```
+
+Ablauf beim Update:
+
+1. Upstream `main` wird geholt (`git fetch` + `reset --hard`).
+2. `pnpm install --frozen-lockfile` und `pnpm build:web` laufen erneut.
+3. Web-Config wird erneut injiziert.
+4. `tolaria.service` und nginx werden neu gestartet.
+5. Vault, Token und Basic-Auth-Passwort bleiben erhalten.
+
+Für einen bestimmten Stand: `--ref <tag-oder-branch>`.
+
+## Backup
+
+Der gesamte Wissensstand liegt im bare Git-Repo:
+
+```bash
+pct exec <CTID> -- tar -C /var/lib -czf /root/tolaria-vault-backup.tar.gz tolaria
+pct pull <CTID> /root/tolaria-vault-backup.tar.gz ./tolaria-vault-backup.tar.gz
+```
+
+Alternativ nur das Git-Repo:
+
+```bash
+pct exec <CTID> -- git --git-dir=/var/lib/tolaria/vault.git bundle create /root/tolaria.bundle --all
+pct pull <CTID> /root/tolaria.bundle ./tolaria.bundle
+```
+
+Zusätzlich sichern: `/etc/tolaria/tolaria.env` und `/root/tolaria-credentials.txt` (enthalten Token/Passwort).
+
+## Restore
+
+```bash
+pct push <CTID> ./tolaria-vault-backup.tar.gz /root/tolaria-vault-backup.tar.gz
+pct exec <CTID> -- bash -lc 'systemctl stop tolaria && tar -C /var/lib -xzf /root/tolaria-vault-backup.tar.gz && chown -R tolaria:tolaria /var/lib/tolaria && systemctl start tolaria'
+```
+
+## Deinstallieren
+
+```bash
+pct stop <CTID>
+pct destroy <CTID>
+```
+
+Vorher Backup erstellen. `pct destroy` löscht den Vault unwiderruflich.
+
+## Troubleshooting
+
+### Build schlägt fehl / OOM
+
+Der TypeScript-/Vite-Build braucht RAM. Mindestens 6 GB, besser 8 GB:
+
+```bash
+# Container stoppen, RAM erhöhen, neu starten
+pct set <CTID> --memory 8192
+pct stop <CTID> && pct start <CTID>
+# Installer erneut ausführen
+```
+
+Der Build-Log liegt im Container unter `/root/tolaria-build.log`:
+
+```bash
+pct exec <CTID> -- tail -n 200 /root/tolaria-build.log
+```
+
+### Service läuft nicht
+
+```bash
+pct exec <CTID> -- systemctl status tolaria --no-pager --full
+pct exec <CTID> -- journalctl -u tolaria --no-pager -n 200
+pct exec <CTID> -- nginx -t
+pct exec <CTID> -- tail -n 100 /var/log/nginx/error.log
+```
+
+### Web-UI lädt, aber keine Notizen
+
+- Prüfen, ob `/v1/vault` mit dem Token antwortet:
+
+```bash
+TOKEN="$(pct exec <CTID> -- bash -lc 'sed -n "s/^TOLARIA_SERVER_TOKEN=//p" /etc/tolaria/tolaria.env')"
+curl -i -H "Authorization: Bearer $TOKEN" http://<LXC-IP>:8080/v1/vault
+```
+
+- Prüfen, ob der Vault geseedet ist:
+
+```bash
+pct exec <CTID> -- git --git-dir=/var/lib/tolaria/vault.git log --oneline -3
+```
+
+- Prüfen, ob das Config-Script im HTML steht:
+
+```bash
+pct exec <CTID> -- grep -n 'tolaria-config.js' /opt/tolaria/src/apps/web/dist/index.html
+```
+
+### Port ändern
+
+```bash
+bash install/tolaria.sh --ctid <CTID> --port 8090
+```
+
+Der Installer schreibt die nginx-Config neu und startet nginx/tolaria neu. Der Vault bleibt erhalten.
+
+### Debug
+
+```bash
+DEBUG=1 bash install/tolaria.sh --ctid <CTID>
+```
+
+Bei Fehlern gibt der Installer Befehl, Zeile, Exit-Code, Stacktrace, `pct config`, `systemctl status`, `journalctl`, `nginx -t`, nginx-Fehlerlog und Disk/RAM aus. Token und Passwörter werden in der Fehlerausgabe redigiert. Die vollständige Ausgabe steht zusätzlich in `/tmp/tolaria-install-*.log` auf dem Host.
+
+## Reboot-Test
+
+Auf dem Proxmox-Host:
+
+```bash
+bash tests/reboot-check.sh <CTID> 8080
+```
+
+Der Test prüft `onboot=1`, `systemctl is-enabled`, rebootet den **Container**, wartet auf den Service und prüft Web-UI, `/healthz`, `/tolaria-config.js`, `/v1/vault` sowie die Persistenz von Vault-HEAD und Server-Daten. Ein echter **Host**-Reboot wird nicht ausgeführt; `onboot=1` wird geprüft, der Host-Neustart muss manuell verifiziert werden.
+
+## Projektstruktur
+
+```text
+install/tolaria.sh              Host-Installer (Proxmox)
+scripts/setup-in-container.sh   Build/Setup im LXC
+scripts/inject-web-config.py    idempotente HTML-Injection
+scripts/seed-vault.sh           bare Git-Vault seeden
+systemd/tolaria.service         systemd-Unit
+nginx/tolaria.conf              nginx-Template (__PORT__, __SERVER_PORT__)
+tests/static-checks.sh          lokale Tests ohne Proxmox
+tests/reboot-check.sh           Reboot-/Persistenz-Test auf Proxmox
+```
+
+## Teststatus
+
+In dieser Umgebung wurde **kein echter Proxmox-Host** ausgeführt. Validiert wurden:
+
+- Bash-Syntax (`bash -n`) und Shellcheck
+- Python-Syntax und idempotente HTML-Injection
+- Vault-Seeding inkl. Idempotenz und Schutz vor Nicht-bare-Verzeichnissen (auch mit dem echten `demo-vault-v2`)
+- nginx-Template-Struktur
+- nginx 1.24 mit dem gerenderten Template lokal: Syntax, Basic-Auth auf `/` und `/tolaria-config.js`, kein Basic-Auth auf `/v1/`, Bearer-Passthrough und öffentliches `/healthz`
+- systemd-Unit (soweit ohne `tolaria`-User/Pfade auf dem Testhost möglich)
+- Installer `--dry-run`, `--help` und Secret-Redaction
+- 44 statische Checks (`tests/static-checks.sh`: alle bestanden)
+
+Der Build (`pnpm install` + `pnpm build:web`) und der Container-Reboot wurden hier **nicht** ausgeführt. Führe auf einem Proxmox-Host aus:
+
+```bash
+bash tests/static-checks.sh
+bash tests/reboot-check.sh <CTID> 8080
+```
+
+## Lizenz / Upstream
+
+Tolaria ist AGPL-3.0-or-later; siehe [refactoringhq/tolaria](https://github.com/refactoringhq/tolaria). Dieses Installer-Repository enthält nur Packaging-/Betriebsskripte und lädt den Upstream-Code zur Build-Zeit. Der Web-Build ist Upstream-Alpha; Funktionen und API können sich ändern.

@@ -1,0 +1,50 @@
+[Unit]
+Description=Tolaria - lokale Markdown-Wissensbasis (Web + Sync-Server)
+Documentation=https://github.com/refactoringhq/tolaria
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=tolaria
+Group=tolaria
+WorkingDirectory=/opt/tolaria/src
+Environment=NODE_ENV=production
+Environment=HOME=/var/lib/tolaria
+Environment=NODE_OPTIONS=--max-old-space-size=2048
+EnvironmentFile=/etc/tolaria/tolaria.env
+ExecStart=/usr/bin/node --experimental-strip-types apps/server/scripts/run.ts apps/server/src/main.ts
+
+Restart=always
+RestartSec=5
+TimeoutStartSec=120
+TimeoutStopSec=30
+
+# Härtung: Schreibzugriff nur auf Vault/State und das Laufzeit-Bundle von run.ts
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/tolaria /opt/tolaria/src/node_modules/.tmp
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+LimitNOFILE=65535
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tolaria
+
+[Install]
+WantedBy=multi-user.target
