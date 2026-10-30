@@ -85,6 +85,7 @@ Basic Auth auf `/v1/*` wäre technisch falsch: Der Client überschreibt den `Aut
 - Proxmox VE 8.x (getestet werden konnte nur statisch, siehe unten)
 - Root-Zugriff auf den Proxmox-Host
 - Internetzugang für Template, NodeSource, npm/pnpm und den Upstream-Build
+- Funktionierende DNS-Auflösung im Container. Der Installer übernimmt die Host-Nameserver, erkennt den systemd-resolved-Stub `127.0.0.53` und repariert `/etc/resolv.conf` automatisch. In Netzen ohne öffentlichen DNS: `--dns "192.168.1.1"`.
 - Mindestens 12 GB freier Storage, 6 GB RAM und 4 vCPU für den Build
 - Port `8080` im LAN erreichbar (oder `--port` ändern)
 
@@ -103,15 +104,17 @@ Basic Auth auf `/v1/*` wäre technisch falsch: Der Client überschreibt den `Aut
 --port PORT          Web-UI-Port (Default: 8080)
 --auth-user USER     Basic-Auth-Benutzer (Default: tolaria)
 --auth-password PW   Basic-Auth-Passwort (Default: zufällig)
+--dns "IP [IP]"      Nameserver im Container (Default: Host-DNS, sonst 1.1.1.1 9.9.9.9)
 --ref REF            Upstream-Branch/Tag (Default: main)
 --password PW        Root-Passwort des Containers (Default: zufällig)
 --ssh-key PATH       SSH-Public-Key in den Container übernehmen
+--force-build        Build auch bei unverändertem Upstream-Commit neu ausführen
 --debug, -x          Trace bis zur Secret-Erzeugung + erweiterte Fehlerkette
 --dry-run            Nur Plan ausgeben, nichts verändern
 --help, -h           Hilfe
 ```
 
-Umgebungsvariablen funktionieren ebenfalls, z. B. `CT_ID`, `CORES`, `RAM`, `SWAP`, `DISK`, `BRIDGE`, `PORT`, `TOLARIA_REF`.
+Umgebungsvariablen funktionieren ebenfalls, z. B. `CT_ID`, `CORES`, `RAM`, `SWAP`, `DISK`, `BRIDGE`, `PORT`, `TOLARIA_REF`, `DNS_SERVERS`, `FORCE_BUILD`.
 
 `--auth-password` erlaubt nur `A-Z a-z 0-9 . _ ~ @ % + = : , / -`. Ohne Angabe wird ein zufälliges Hex-Passwort erzeugt. `--debug` pausiert den Trace bewusst vor der Secret-Erzeugung, damit Token/Passwörter nicht im Install-Log landen.
 
@@ -125,11 +128,17 @@ bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/TolariaNo
 
 Ablauf beim Update:
 
-1. Upstream `main` wird geholt (`git fetch` + `reset --hard`).
-2. `pnpm install --frozen-lockfile` und `pnpm build:web` laufen erneut.
-3. Web-Config wird erneut injiziert.
+1. Upstream `main` wird geholt (`git fetch`).
+2. Ist der Commit unverändert und der Web-Build vorhanden, werden `pnpm install` und `pnpm build:web` **übersprungen** (normale Updates dauern dadurch Sekunden statt 10-25 Minuten).
+3. Bei neuem Commit: `pnpm install --frozen-lockfile`, `pnpm build:web`, Web-Config wird erneut injiziert.
 4. `tolaria.service` und nginx werden neu gestartet.
 5. Vault, Token und Basic-Auth-Passwort bleiben erhalten.
+
+Ein Rebuild lässt sich jederzeit erzwingen:
+
+```bash
+FORCE_BUILD=1 bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/TolariaNotizen/main/install/tolaria.sh)"
+```
 
 Für einen bestimmten Stand: `--ref <tag-oder-branch>`.
 
@@ -168,6 +177,30 @@ pct destroy <CTID>
 Vorher Backup erstellen. `pct destroy` löscht den Vault unwiderruflich.
 
 ## Troubleshooting
+
+### `Temporary failure resolving 'deb.debian.org'` / apt Exit-Code 100
+
+Das ist der häufigste Installationsfehler in Proxmox-LXCs. Ursache ist fast immer eine kaputte `/etc/resolv.conf` im Container: Läuft auf dem Host `systemd-resolved`, übernimmt Proxmox den Stub `nameserver 127.0.0.53`, der **innerhalb** des Containers nicht erreichbar ist. Es gibt dann eine Default-Route, aber keine Namensauflösung.
+
+Der Installer prüft DNS vor `apt-get` und repariert die Datei automatisch. Schlägt die Reparatur fehl, bricht er mit einer klaren Meldung ab, statt 84 MB Downloads einzeln scheitern zu lassen. Welche Nameserver tatsächlich funktionieren, liest er nach der Reparatur aus dem Container und hinterlegt genau diese dauerhaft via `pct set --nameserver` – auch wenn dafür der öffentliche Fallback `1.1.1.1 9.9.9.9` nötig war.
+
+Bereits vorhandenen Container manuell reparieren:
+
+```bash
+CTID=106
+pct set "$CTID" --nameserver "1.1.1.1 9.9.9.9"
+pct exec "$CTID" -- bash -c 'printf "nameserver 1.1.1.1\nnameserver 9.9.9.9\noptions timeout:2 attempts:2\n" > /etc/resolv.conf'
+pct reboot "$CTID"
+pct exec "$CTID" -- getent hosts deb.debian.org
+```
+
+Danach den Installer erneut ausführen. In einem LAN ohne öffentlichen DNS die dort gültigen Resolver verwenden:
+
+```bash
+DNS_SERVERS="192.168.1.1" bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/TolariaNotizen/main/install/tolaria.sh)"
+```
+
+`pct set --nameserver` ist wichtig: Ohne den Eintrag in der CT-Config schreibt Proxmox die kaputte Datei beim nächsten Start wieder.
 
 ### Build schlägt fehl / OOM
 
@@ -247,12 +280,14 @@ Der Test prüft `onboot=1`, `systemctl is-enabled`, rebootet den **Container**, 
 ```text
 install/tolaria.sh              Host-Installer (Proxmox)
 scripts/setup-in-container.sh   Build/Setup im LXC
+scripts/repair-dns.sh           DNS-Check/-Reparatur im Container
 scripts/inject-web-config.py    idempotente HTML-Injection
 scripts/seed-vault.sh           bare Git-Vault seeden
 systemd/tolaria.service         systemd-Unit
 nginx/tolaria.conf              nginx-Template (__PORT__, __SERVER_PORT__)
 tests/static-checks.sh          lokale Tests ohne Proxmox
 tests/reboot-check.sh           Reboot-/Persistenz-Test auf Proxmox
+.github/workflows/ci.yml        CI: statische Checks bei Push/PR
 ```
 
 ## Teststatus
@@ -263,10 +298,15 @@ In dieser Umgebung wurde **kein echter Proxmox-Host** ausgeführt. Validiert wur
 - Python-Syntax und idempotente HTML-Injection
 - Vault-Seeding inkl. Idempotenz und Schutz vor Nicht-bare-Verzeichnissen (auch mit dem echten `demo-vault-v2`)
 - nginx-Template-Struktur
-- nginx 1.24 mit dem gerenderten Template lokal: Syntax, Basic-Auth auf `/` und `/tolaria-config.js`, kein Basic-Auth auf `/v1/`, Bearer-Passthrough und öffentliches `/healthz`
+- nginx 1.24 mit dem gerenderten Template lokal: Syntax, Basic-Auth auf `/` und `/tolaria-config.js`, kein Basic-Auth auf `/v1/`, Bearer-Passthrough, gzip/Asset-Caching und öffentliches `/healthz` als Proxy zum Server
 - systemd-Unit (soweit ohne `tolaria`-User/Pfade auf dem Testhost möglich)
 - Installer `--dry-run`, `--help` und Secret-Redaction
-- 44 statische Checks (`tests/static-checks.sh`: alle bestanden)
+- DNS-Reparatur (`scripts/repair-dns.sh`): Rendering der `resolv.conf`, Validierung von Nameservern, Ablehnung ungültiger Eingaben, Fallback-Nameserver und Backup/Restore
+- Persistenz der tatsächlich funktionierenden Nameserver in der CT-Config (statisch geprüft)
+- Statische Prüfung, dass apt-Fehler nicht mehr ignoriert werden (`Failed to fetch`-Erkennung, Retries)
+- Statische Prüfung des inkrementellen Updates (`FORCE_BUILD`, Build-Skip)
+- `tests/static-checks.sh` (alle Checks bestanden)
+- GitHub-Actions-CI (`.github/workflows/ci.yml`) führt dieselben Checks bei Push/PR aus
 - Realer Build-Test mit Upstream `main`: `pnpm install --frozen-lockfile` (pnpm 10.33.0, Node 22) und `pnpm build:web` erfolgreich
 - HTML-Injection gegen den echten Web-Build (`index.html` und `apps/web/collab.html`)
 - Lokaler Server-E2E-Test mit dem echten `demo-vault-v2`: `/healthz`, `/v1/vault`, `/v1/entries`, Datei-Lesen/Schreiben/Löschen, Git-Push ins bare Repo

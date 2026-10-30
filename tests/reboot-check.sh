@@ -83,10 +83,11 @@ IP="$(pct exec "$CTID" -- hostname -I 2>/dev/null | awk '{print $1}')"
 if [[ -n "$IP" ]]; then pass "Container-IP: ${IP}"; else fail "Container-IP nicht ermittelbar"; fi
 
 if [[ -n "$IP" ]]; then
-  if curl -fsS --max-time 10 "http://${IP}:${PORT}/healthz" | grep -q '^ok'; then
+  HEALTH_BODY="$(curl -fsS --max-time 10 "http://${IP}:${PORT}/healthz" 2>/dev/null || true)"
+  if [[ "$HEALTH_BODY" == *'"status":"ok"'* || "$HEALTH_BODY" == ok* ]]; then
     pass "GET /healthz nach Reboot"
   else
-    fail "GET /healthz nach Reboot"
+    fail "GET /healthz nach Reboot (Antwort: ${HEALTH_BODY:-<leer>})"
   fi
 
   CREDS="$(pct exec "$CTID" -- cat /root/tolaria-credentials.txt 2>/dev/null || true)"

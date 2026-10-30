@@ -46,6 +46,12 @@ on_error() {
   msg_error "--- journalctl -u ${APP} (letzte 200 Zeilen) ---"
   journalctl -u "${APP}" --no-pager -n 200 2>&1 || true
   echo ""
+  msg_error "--- DNS / Netzwerk ---"
+  cat /etc/resolv.conf 2>&1 || true
+  getent hosts deb.debian.org 2>&1 || echo "DNS-Auflösung fehlgeschlagen"
+  ip -4 route 2>&1 || true
+  ip -4 addr show dev eth0 2>&1 || true
+  echo ""
   msg_error "--- nginx -t ---"
   nginx -t 2>&1 || true
   echo ""
@@ -88,6 +94,9 @@ set +a
 : "${TOLARIA_TOKEN:?TOLARIA_TOKEN fehlt}"
 : "${AUTH_USER:?AUTH_USER fehlt}"
 : "${AUTH_PASS:?AUTH_PASS fehlt}"
+CTID="${CTID:-<CTID>}"
+TOLARIA_DNS_SERVERS="${TOLARIA_DNS_SERVERS:-1.1.1.1 9.9.9.9}"
+FORCE_BUILD="${FORCE_BUILD:-0}"
 
 [[ "$PORT" =~ ^[0-9]+$ ]] && (( PORT > 0 && PORT < 65536 )) || { msg_error "PORT ungültig"; exit 1; }
 [[ "$SERVER_PORT" =~ ^[0-9]+$ ]] && (( SERVER_PORT > 0 && SERVER_PORT < 65536 )) || { msg_error "SERVER_PORT ungültig"; exit 1; }
@@ -98,18 +107,86 @@ set +a
 [[ "$AUTH_PASS" =~ ^[A-Za-z0-9._~@%+=:,/-]+$ ]] || { msg_error "AUTH_PASS enthält nicht unterstützte Zeichen"; exit 1; }
 [[ "$UPSTREAM_REF" =~ ^[A-Za-z0-9._/][A-Za-z0-9._/-]*$ ]] || { msg_error "UPSTREAM_REF ungültig"; exit 1; }
 
+APT_PACKAGES=(
+  ca-certificates curl gnupg git build-essential python3
+  nginx apache2-utils openssl procps iproute2
+)
+APT_OPTS=(-o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+APT_LOG="/root/tolaria-apt-update.log"
+
+retry() {
+  local attempts="$1" delay="$2"; shift 2
+  local i
+  for ((i = 1; i <= attempts; i++)); do
+    if "$@"; then
+      return 0
+    fi
+    if (( i < attempts )); then
+      msg_warn "Versuch ${i}/${attempts} fehlgeschlagen - neuer Versuch in ${delay}s ..."
+      sleep "$delay"
+    fi
+  done
+  return 1
+}
+
 msg_info "Setup für ${APP} (Web-Port ${PORT}, Server 127.0.0.1:${SERVER_PORT})"
 msg_info "Build-Log: ${BUILD_LOG}"
+
+# ---------------------------------------------------------------------------
+# DNS prüfen (der Host-Installer hat das meist schon erledigt; hier als Guard,
+# falls das Setup direkt oder nach einem CT-Reboot erneut läuft)
+# ---------------------------------------------------------------------------
+msg_info "Prüfe DNS-Auflösung ..."
+if [[ -f "${PKG_DIR}/repair-dns.sh" ]]; then
+  if ! bash "${PKG_DIR}/repair-dns.sh" --servers "$TOLARIA_DNS_SERVERS"; then
+    msg_error "DNS-Auflösung funktioniert nicht - apt-get würde mit"
+    msg_error "\"Temporary failure resolving ...\" scheitern."
+    msg_error "Auf dem Proxmox-Host:"
+    msg_error "  pct set ${CTID} --nameserver \"${TOLARIA_DNS_SERVERS}\""
+    msg_error "  pct reboot ${CTID}"
+    msg_error "Danach den Installer erneut ausführen."
+    exit 1
+  fi
+elif ! getent hosts deb.debian.org >/dev/null 2>&1; then
+  msg_error "DNS-Auflösung fehlgeschlagen und ${PKG_DIR}/repair-dns.sh fehlt."
+  cat /etc/resolv.conf 2>/dev/null || true
+  exit 1
+fi
 
 # ---------------------------------------------------------------------------
 # Pakete
 # ---------------------------------------------------------------------------
 msg_info "Aktualisiere Paketlisten und installiere Systempakete ..."
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y --no-install-recommends \
-  ca-certificates curl gnupg git build-essential python3 \
-  nginx apache2-utils openssl procps iproute2
+
+# apt-get update kann mit Exit 0 enden, obwohl ALLE Indexe nicht geladen
+# wurden ("W: Failed to fetch ... Some index files failed to download").
+# Deshalb wird die Ausgabe geprüft und der Fall explizit behandelt.
+if ! retry 3 5 apt-get update "${APT_OPTS[@]}" >"$APT_LOG" 2>&1; then
+  cat "$APT_LOG"
+  msg_error "apt-get update ist fehlgeschlagen (DNS, Proxy oder Mirror-Problem)."
+  msg_error "Nameserver: ${TOLARIA_DNS_SERVERS}"
+  cat /etc/resolv.conf 2>/dev/null || true
+  exit 1
+fi
+
+if grep -qE 'Failed to fetch|Temporary failure resolving|Could not resolve' "$APT_LOG"; then
+  msg_warn "apt-get update meldet Fetch-Fehler - prüfe, ob die Pakete trotzdem auflösbar sind ..."
+  if apt-get install -y --simulate --no-install-recommends "${APT_OPTS[@]}" "${APT_PACKAGES[@]}" >/dev/null 2>&1; then
+    msg_warn "Paketauflösung funktioniert trotz Fetch-Warnungen - fahre fort."
+  else
+    cat "$APT_LOG"
+    msg_error "Paketlisten unvollständig und Pakete nicht auflösbar."
+    msg_error "Prüfe DNS/Proxy/Internet im Container und führe den Installer erneut aus."
+    exit 1
+  fi
+fi
+
+if ! retry 3 10 apt-get install -y --no-install-recommends "${APT_OPTS[@]}" "${APT_PACKAGES[@]}"; then
+  msg_error "Systempakete konnten nicht installiert werden."
+  msg_error "Häufigste Ursache: DNS/Internet/Proxy im Container (siehe ${APT_LOG})."
+  exit 1
+fi
 msg_ok "Systempakete installiert."
 
 # ---------------------------------------------------------------------------
@@ -128,9 +205,17 @@ fi
 
 if [[ "$need_node" == "1" ]]; then
   msg_info "Installiere Node.js 22.x von NodeSource ..."
-  curl -fsSL https://deb.nodesource.com/setup_22.x -o /tmp/nodesource_setup.sh
+  if ! retry 3 5 curl -fsSL --max-time 60 https://deb.nodesource.com/setup_22.x -o /tmp/nodesource_setup.sh; then
+    msg_error "NodeSource-Setup konnte nicht geladen werden (https://deb.nodesource.com)."
+    msg_error "Prüfe DNS/Internet/Proxy im Container."
+    exit 1
+  fi
   bash /tmp/nodesource_setup.sh
-  apt-get install -y nodejs
+  rm -f /tmp/nodesource_setup.sh
+  if ! retry 3 10 apt-get install -y "${APT_OPTS[@]}" nodejs; then
+    msg_error "Node.js konnte nicht installiert werden."
+    exit 1
+  fi
 else
   msg_ok "Node.js $(node --version) bereits vorhanden."
 fi
@@ -150,7 +235,10 @@ if ! command -v npm >/dev/null 2>&1; then
   exit 1
 fi
 msg_info "Installiere pnpm 10.33.0 global ..."
-npm install -g --no-fund --no-audit pnpm@10.33.0
+if ! retry 3 10 npm install -g --no-fund --no-audit pnpm@10.33.0; then
+  msg_error "pnpm konnte nicht über npm installiert werden (Registry erreichbar?)."
+  exit 1
+fi
 pnpm_version="$(pnpm --version)"
 [[ "$pnpm_version" == "10.33.0" ]] || { msg_error "pnpm-Version ist ${pnpm_version}, erwartet 10.33.0"; exit 1; }
 msg_ok "pnpm ${pnpm_version}"
@@ -171,25 +259,46 @@ msg_ok "Benutzer ${APP} und Verzeichnisse vorbereitet."
 # ---------------------------------------------------------------------------
 # Upstream-Quellcode (idempotent aktualisieren)
 # ---------------------------------------------------------------------------
+DIST_DIR="/opt/tolaria/src/apps/web/dist"
+NEED_BUILD=1
+
 if [[ -d /opt/tolaria/src/.git ]]; then
+  CURRENT_REV="$(git -C /opt/tolaria/src rev-parse HEAD 2>/dev/null || true)"
   msg_info "Aktualisiere Tolaria-Quellcode auf ${UPSTREAM_REF} ..."
   git -C /opt/tolaria/src remote set-url origin "$UPSTREAM_REPO"
-  git -C /opt/tolaria/src fetch --depth 1 origin "$UPSTREAM_REF"
-  git -C /opt/tolaria/src reset --hard FETCH_HEAD
-  git -C /opt/tolaria/src clean -fdx -e node_modules >/dev/null 2>&1 || true
+  if ! git -C /opt/tolaria/src fetch --depth 1 origin "$UPSTREAM_REF"; then
+    msg_error "git fetch ist fehlgeschlagen (GitHub erreichbar? DNS/Proxy?)."
+    exit 1
+  fi
+  TARGET_REV="$(git -C /opt/tolaria/src rev-parse FETCH_HEAD)"
+
+  if [[ "$FORCE_BUILD" != "1" && -n "$CURRENT_REV" && "$CURRENT_REV" == "$TARGET_REV" \
+        && -s "$DIST_DIR/index.html" && -d /opt/tolaria/src/node_modules ]]; then
+    NEED_BUILD=0
+    msg_ok "Upstream unverändert ($(git -C /opt/tolaria/src rev-parse --short HEAD)) - Build wird übersprungen."
+  else
+    git -C /opt/tolaria/src reset --hard FETCH_HEAD
+    git -C /opt/tolaria/src clean -fdx -e node_modules >/dev/null 2>&1 || true
+  fi
 else
   msg_info "Klone Tolaria (${UPSTREAM_REF}) ..."
   rm -rf /opt/tolaria/src
   if ! git clone --depth 1 --branch "$UPSTREAM_REF" "$UPSTREAM_REPO" /opt/tolaria/src 2>/dev/null; then
     msg_warn "Direkter Branch/Tag-Clone fehlgeschlagen - versuche Commit/Ref über fetch."
     rm -rf /opt/tolaria/src
-    git clone --depth 1 "$UPSTREAM_REPO" /opt/tolaria/src
+    if ! git clone --depth 1 "$UPSTREAM_REPO" /opt/tolaria/src; then
+      msg_error "git clone ist fehlgeschlagen (GitHub erreichbar? DNS/Proxy?)."
+      exit 1
+    fi
     git -C /opt/tolaria/src fetch --depth 1 origin "$UPSTREAM_REF"
     git -C /opt/tolaria/src checkout -f FETCH_HEAD
   fi
 fi
 git config --global --add safe.directory /opt/tolaria/src >/dev/null 2>&1 || true
-chown -R "$APP:$APP" /opt/tolaria/src
+if [[ "$NEED_BUILD" == "1" ]]; then
+  # Nur bei Änderungen nötig; spart bei Updates ohne neuen Commit viel Zeit.
+  chown -R "$APP:$APP" /opt/tolaria/src
+fi
 msg_ok "Quellcode: $(git -C /opt/tolaria/src rev-parse --short HEAD) (${UPSTREAM_REF})"
 
 # ---------------------------------------------------------------------------
@@ -201,26 +310,42 @@ VAULT_OWNER="$APP" VAULT_GROUP="$APP" \
 msg_ok "Git-Vault bereit."
 
 # ---------------------------------------------------------------------------
-# Build
+# Build (nur bei neuem Commit, fehlendem Build oder --force-build)
 # ---------------------------------------------------------------------------
-msg_info "Installiere pnpm-Abhängigkeiten (kann einige Minuten dauern) ..."
-runuser -u "$APP" -- env \
-  HOME="/home/$APP" \
-  HUSKY=0 \
-  CI=1 \
-  NODE_OPTIONS="--max-old-space-size=4096" \
-  bash -lc 'cd /opt/tolaria/src && pnpm install --frozen-lockfile'
+if [[ "$NEED_BUILD" == "1" ]]; then
+  free_mb="$(df -Pm /opt/tolaria 2>/dev/null | awk 'NR==2 {print $4}')"
+  if [[ "$free_mb" =~ ^[0-9]+$ ]] && (( free_mb < 3072 )); then
+    msg_error "Zu wenig freier Platz für den Build: ${free_mb} MB (benötigt: >= 3072 MB)."
+    msg_error "Disk vergrößern (pct resize ${CTID} rootfs +4G) und Installer erneut ausführen."
+    exit 1
+  fi
 
-msg_info "Baue Tolaria Web (tsc + vite) ..."
-runuser -u "$APP" -- env \
-  HOME="/home/$APP" \
-  CI=1 \
-  NODE_OPTIONS="--max-old-space-size=4096" \
-  bash -lc 'cd /opt/tolaria/src && pnpm build:web'
+  msg_info "Installiere pnpm-Abhängigkeiten (kann einige Minuten dauern) ..."
+  if ! runuser -u "$APP" -- env \
+    HOME="/home/$APP" \
+    HUSKY=0 \
+    CI=1 \
+    NODE_OPTIONS="--max-old-space-size=4096" \
+    bash -lc 'cd /opt/tolaria/src && pnpm install --frozen-lockfile'; then
+    msg_error "pnpm install ist fehlgeschlagen (Registry/Netzwerk oder Lockfile)."
+    exit 1
+  fi
 
-DIST_DIR="/opt/tolaria/src/apps/web/dist"
-[[ -s "$DIST_DIR/index.html" ]] || { msg_error "Build unvollständig: ${DIST_DIR}/index.html fehlt."; exit 1; }
-msg_ok "Web-Build erzeugt: ${DIST_DIR}"
+  msg_info "Baue Tolaria Web (tsc + vite) ..."
+  if ! runuser -u "$APP" -- env \
+    HOME="/home/$APP" \
+    CI=1 \
+    NODE_OPTIONS="--max-old-space-size=4096" \
+    bash -lc 'cd /opt/tolaria/src && pnpm build:web'; then
+    msg_error "pnpm build:web ist fehlgeschlagen (siehe ${BUILD_LOG})."
+    exit 1
+  fi
+
+  [[ -s "$DIST_DIR/index.html" ]] || { msg_error "Build unvollständig: ${DIST_DIR}/index.html fehlt."; exit 1; }
+  msg_ok "Web-Build erzeugt: ${DIST_DIR}"
+else
+  msg_info "Build übersprungen (unveränderter Commit). Mit --force-build erzwingen."
+fi
 
 # nginx (www-data) muss den Build lesen können; umask 077 hat restriktive Rechte erzeugt.
 chmod 755 /opt/tolaria /opt/tolaria/src /opt/tolaria/src/apps /opt/tolaria/src/apps/web "$DIST_DIR"
@@ -275,14 +400,18 @@ msg_ok "systemd-Unit installiert und aktiviert."
 # nginx + Basic Auth
 # ---------------------------------------------------------------------------
 msg_info "Richte nginx und Basic Auth ein ..."
-if [[ ! -f /etc/nginx/.htpasswd-tolaria ]]; then
-  htpasswd -bc /etc/nginx/.htpasswd-tolaria "$AUTH_USER" "$AUTH_PASS"
+HTPASSWD_FILE="/etc/nginx/.htpasswd-tolaria"
+# Passwort über stdin statt via -b (steht sonst kurz in der Prozessliste).
+# Bevorzugt bcrypt; Fallback auf das APR1-Standardformat, falls crypt fehlt.
+if [[ -f "$HTPASSWD_FILE" ]]; then
+  printf '%s\n' "$AUTH_PASS" | htpasswd -i -B "$HTPASSWD_FILE" "$AUTH_USER" 2>/dev/null \
+    || printf '%s\n' "$AUTH_PASS" | htpasswd -i "$HTPASSWD_FILE" "$AUTH_USER"
 else
-  htpasswd -b /etc/nginx/.htpasswd-tolaria "$AUTH_USER" "$AUTH_PASS" \
-    || htpasswd -bc /etc/nginx/.htpasswd-tolaria "$AUTH_USER" "$AUTH_PASS"
+  printf '%s\n' "$AUTH_PASS" | htpasswd -i -B -c "$HTPASSWD_FILE" "$AUTH_USER" 2>/dev/null \
+    || printf '%s\n' "$AUTH_PASS" | htpasswd -i -c "$HTPASSWD_FILE" "$AUTH_USER"
 fi
-chown root:www-data /etc/nginx/.htpasswd-tolaria
-chmod 640 /etc/nginx/.htpasswd-tolaria
+chown root:www-data "$HTPASSWD_FILE"
+chmod 640 "$HTPASSWD_FILE"
 
 sed -e "s|__PORT__|${PORT}|g" \
     -e "s|__SERVER_PORT__|${SERVER_PORT}|g" \

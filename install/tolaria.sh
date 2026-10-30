@@ -41,6 +41,9 @@ FEATURES=""                                     # kein Docker/nesting nötig
 HOSTNAME_ARG="${CT_HOSTNAME:-$APP}"
 AUTH_USER="${AUTH_USER:-tolaria}"
 AUTH_PASS="${AUTH_PASS:-}"
+DNS_SERVERS="${DNS_SERVERS:-}"                  # optional, z. B. "192.168.1.1 1.1.1.1"
+FALLBACK_DNS_SERVERS="1.1.1.1 9.9.9.9"
+FORCE_BUILD="${FORCE_BUILD:-0}"
 
 DEBUG="${DEBUG:-0}"
 DRY_RUN=0
@@ -84,9 +87,11 @@ Optionen:
   --port PORT          Web-UI-Port (Default: ${PORT})
   --auth-user USER     Basic-Auth-Benutzer (Default: tolaria)
   --auth-password PW   Basic-Auth-Passwort (Default: zufällig, wird angezeigt)
+  --dns "IP [IP]"      Nameserver im Container (Default: Host-DNS, sonst 1.1.1.1/9.9.9.9)
   --ref REF            Upstream-Branch/Tag (Default: ${UPSTREAM_REF})
   --password PW        Root-Passwort des Containers (Default: zufällig)
   --ssh-key PATH       SSH Public Key in den Container übernehmen (optional)
+  --force-build        Build auch bei unverändertem Upstream-Commit neu ausführen
   --debug, -x          Trace bis zur Secret-Erzeugung + maximale Fehlerkette
   --dry-run            Nur Plan/Argumente ausgeben, nichts verändern
   --help, -h           diese Hilfe
@@ -95,6 +100,44 @@ Nach der Installation:
   Web UI: http://<LXC-IP>:${PORT}
   Login:  siehe Ausgabe (Basic Auth)
 EOF
+}
+
+# ---------------------------------------------------------------------------
+# DNS-Ermittlung
+# ---------------------------------------------------------------------------
+# Proxmox schreibt beim Start die Host-Nameserver in /etc/resolv.conf des CT.
+# Steht dort der systemd-resolved-Stub 127.0.0.53, kann der Container nichts
+# auflösen. Deshalb ermitteln wir hier echte, nicht-lokale Nameserver.
+detect_dns_servers() {
+  local ns=""
+  if [[ -n "$DNS_SERVERS" ]]; then
+    printf '%s\n' "$DNS_SERVERS"
+    return 0
+  fi
+
+  # systemd-resolved: echte Upstream-Server stehen in der Runtime-Datei.
+  if [[ -r /run/systemd/resolve/resolv.conf ]]; then
+    ns="$(awk '/^nameserver/ {print $2}' /run/systemd/resolve/resolv.conf 2>/dev/null \
+      | grep -vE '^(127\.|::1$)' | head -n3 | paste -sd' ' - || true)"
+  fi
+
+  # Fallback: resolvectl (Ubuntu/Debian mit systemd-resolved).
+  if [[ -z "$ns" ]] && command -v resolvectl >/dev/null 2>&1; then
+    ns="$(resolvectl dns 2>/dev/null \
+      | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' \
+      | grep -vE '^127\.' | head -n3 | paste -sd' ' - || true)"
+  fi
+
+  # Fallback: /etc/resolv.conf, aber ohne Loopback-Stubs.
+  if [[ -z "$ns" && -r /etc/resolv.conf ]]; then
+    ns="$(awk '/^nameserver/ {print $2}' /etc/resolv.conf 2>/dev/null \
+      | grep -vE '^(127\.|::1$)' | head -n3 | paste -sd' ' - || true)"
+  fi
+
+  if [[ -z "$ns" ]]; then
+    ns="$FALLBACK_DNS_SERVERS"
+  fi
+  printf '%s\n' "$ns"
 }
 
 # ---------------------------------------------------------------------------
@@ -134,6 +177,11 @@ on_error() {
     pct config "${CTID}" 2>&1 || true
     echo ""
     if pct status "${CTID}" 2>/dev/null | grep -q running; then
+      msg_error "--- DNS / Netzwerk im Container ---"
+      pct exec "${CTID}" -- bash -c 'cat /etc/resolv.conf' 2>&1 || true
+      pct exec "${CTID}" -- bash -c 'getent hosts deb.debian.org || echo "DNS-Auflösung fehlgeschlagen"' 2>&1 || true
+      pct exec "${CTID}" -- bash -c 'ip -4 route 2>/dev/null; ip -4 addr show dev eth0 2>/dev/null' 2>&1 || true
+      echo ""
       msg_error "--- systemctl status ${APP} ---"
       pct exec "${CTID}" -- systemctl status "${APP}" --no-pager --full 2>&1 || true
       echo ""
@@ -188,9 +236,11 @@ while [[ $# -gt 0 ]]; do
     --port)            PORT="${2:?--port braucht einen Wert}"; shift 2 ;;
     --auth-user)       AUTH_USER="${2:?--auth-user braucht einen Wert}"; shift 2 ;;
     --auth-password)   AUTH_PASS="${2:?--auth-password braucht einen Wert}"; shift 2 ;;
+    --dns)             DNS_SERVERS="${2:?--dns braucht einen Wert}"; shift 2 ;;
     --ref)             REF="${2:?--ref braucht einen Wert}"; shift 2 ;;
     --password)        ROOT_PASSWORD="${2:?--password braucht einen Wert}"; shift 2 ;;
     --ssh-key)         SSH_KEY="${2:?--ssh-key braucht einen Wert}"; shift 2 ;;
+    --force-build)     FORCE_BUILD=1; shift ;;
     --debug|-x)        DEBUG="1"; shift ;;
     --dry-run)         DRY_RUN=1; shift ;;
     --help|-h)         usage; exit 0 ;;
@@ -210,6 +260,27 @@ if [[ -n "$AUTH_PASS" ]]; then
     || { msg_error "AUTH_PASS enthält nicht unterstützte Zeichen. Erlaubt: A-Z a-z 0-9 . _ ~ @ % + = : , / -"; exit 1; }
 fi
 [[ "$REF" =~ ^[A-Za-z0-9._/][A-Za-z0-9._/-]*$ ]] || { msg_error "REF ungültig: $REF"; exit 1; }
+[[ "$FORCE_BUILD" =~ ^[01]$ ]] || { msg_error "FORCE_BUILD muss 0 oder 1 sein."; exit 1; }
+if [[ -n "$DNS_SERVERS" ]]; then
+  read -r -a DNS_ARRAY <<< "$DNS_SERVERS"
+  (( ${#DNS_ARRAY[@]} <= 3 )) || { msg_error "--dns erlaubt maximal 3 Nameserver."; exit 1; }
+  for ns in "${DNS_ARRAY[@]}"; do
+    [[ "$ns" =~ ^[0-9A-Fa-f:.]+$ ]] \
+      || { msg_error "Ungültiger Nameserver in --dns: '$ns' (erwartet IPv4/IPv6)."; exit 1; }
+  done
+fi
+
+CT_DNS="$(detect_dns_servers)"
+# Erkannte Werte defensiv prüfen: pct create/set akzeptiert nur IPs.
+read -r -a CT_DNS_ARRAY <<< "$CT_DNS"
+CT_DNS_VALID=1
+for ns in "${CT_DNS_ARRAY[@]}"; do
+  [[ "$ns" =~ ^[0-9A-Fa-f:.]+$ ]] || CT_DNS_VALID=0
+done
+if (( ${#CT_DNS_ARRAY[@]} == 0 )) || [[ "$CT_DNS_VALID" != "1" ]]; then
+  msg_warn "Ermittelte Nameserver sind unbrauchbar ('${CT_DNS}') - nutze ${FALLBACK_DNS_SERVERS}."
+  CT_DNS="$FALLBACK_DNS_SERVERS"
+fi
 
 if [[ "$DRY_RUN" == "1" ]]; then
   cat <<EOF
@@ -223,18 +294,21 @@ ${APP_TITLE} - Dry Run (es wird nichts verändert)
   Bridge           : ${BRIDGE}
   Web-UI-Port      : ${PORT}
   Tolaria-Server   : 127.0.0.1:${SERVER_PORT}
+  Nameserver (CT)  : ${CT_DNS}
   Upstream         : ${UPSTREAM_REPO} @ ${REF}
   Basic-Auth-User  : ${AUTH_USER}
+  Build erzwingen  : ${FORCE_BUILD}
   Installer-Repo   : ${INSTALLER_RAW}
 
 Ablauf:
   1. Template ${DEFAULT_OS} sicherstellen
   2. LXC erstellen/wiederverwenden, onboot=1, unprivileged=${UNPRIVILEGED}
-  3. Node 22 + pnpm 10.33 + nginx + git im CT installieren
-  4. Upstream klonen, pnpm install, pnpm build:web
-  5. Vault /var/lib/${APP}/vault.git seeden (demo-vault-v2)
-  6. tolaria.service + nginx + Basic Auth einrichten
-  7. Service/HTTP/Proxy verifizieren, URL + Zugang ausgeben
+  3. DNS im CT prüfen und bei Bedarf reparieren (systemd-resolved-Stub)
+  4. Node 22 + pnpm 10.33 + nginx + git im CT installieren
+  5. Upstream klonen, pnpm install, pnpm build:web (übersprungen, wenn Commit unverändert)
+  6. Vault /var/lib/${APP}/vault.git seeden (demo-vault-v2)
+  7. tolaria.service + nginx + Basic Auth einrichten
+  8. Service/HTTP/Proxy verifizieren, URL + Zugang ausgeben
 
 Dauer: erster Lauf inkl. pnpm install und pnpm build:web 10-25 Minuten.
 Hinweis: Ein echter LXC-Start ist nur auf einem Proxmox-VE-Host möglich.
@@ -246,6 +320,7 @@ fi
 exec > >(tee -i "$LOG_FILE") 2>&1
 chmod 600 "$LOG_FILE" 2>/dev/null || true
 msg_info "Logdatei: $LOG_FILE"
+msg_info "Container-Nameserver: ${CT_DNS}"
 if [[ "$DEBUG" == "1" ]]; then
   echo "--- DEBUG: set -x aktiv ---"
   set -x
@@ -274,6 +349,18 @@ if [[ "$DEFAULT_RAM" -lt 4096 ]]; then
 fi
 if [[ "$DEFAULT_DISK" -lt 10 ]]; then
   msg_warn "DISK=${DEFAULT_DISK} GB < 10 GB - node_modules + pnpm-Store + Build brauchen mehr."
+fi
+if command -v ip >/dev/null 2>&1 && ! ip link show "$BRIDGE" >/dev/null 2>&1; then
+  msg_warn "Bridge '${BRIDGE}' existiert nicht auf diesem Host. Mit --bridge <name> anpassen."
+fi
+# Der Hinweis "Sum of all thin volume sizes exceeds ..." aus dem pct-create-Log
+# ist ein echtes Risiko: ein voller Thin-Pool kann ALLE Container korrumpieren.
+if command -v lvs >/dev/null 2>&1; then
+  thin_full="$(LC_ALL=C lvs --noheadings -o lv_name,data_percent 2>/dev/null \
+    | awk '$2 != "" && $2 + 0 >= 85 {printf "%s(%.0f%%) ", $1, $2}' || true)"
+  if [[ -n "$thin_full" ]]; then
+    msg_warn "Thin-Pool(s) fast voll: ${thin_full}- vor der Installation Platz schaffen (lvs/df -h prüfen)."
+  fi
 fi
 msg_ok "Host-Checks bestanden."
 
@@ -313,6 +400,12 @@ if [[ -z "$STORAGE_ARG" ]]; then
 else
   msg_info "RootFS-Storage (vorgegeben): $STORAGE_ARG"
 fi
+if ! pvesm status --content rootdir 2>/dev/null | awk 'NR>1 {print $1}' | grep -qx "$STORAGE_ARG"; then
+  msg_error "Storage '${STORAGE_ARG}' ist unbekannt oder unterstützt kein rootdir."
+  msg_error "Verfügbare Storages mit rootdir:"
+  pvesm status --content rootdir 2>&1 || true
+  exit 1
+fi
 
 # ---------------------------------------------------------------------------
 # Template sicherstellen
@@ -335,6 +428,49 @@ if ! pveam list "$TEMPLATE_STORE" 2>/dev/null | grep -Fq "$TEMPLATE_FILE"; then
   pveam download "$TEMPLATE_STORE" "$TEMPLATE_FILE"
 else
   msg_ok "Template bereits vorhanden - Download übersprungen (idempotent)."
+fi
+
+# ---------------------------------------------------------------------------
+# Packaging-Dateien: aus Repo laden (oder lokal für Tests)
+# ---------------------------------------------------------------------------
+# Bewusst VOR dem Container-Start: so scheitert ein kaputter Download, bevor
+# ein halbfertiger Container zurückbleibt. repair-dns.sh wird direkt danach
+# gebraucht, um DNS im CT zu prüfen/reparieren.
+PKG_DIR="$(mktemp -d /tmp/tolaria-packaging.XXXXXX)"
+cleanup() {
+  rm -rf "$PKG_DIR" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+PACKAGING_FILES=(
+  "scripts/setup-in-container.sh"
+  "scripts/inject-web-config.py"
+  "scripts/seed-vault.sh"
+  "scripts/repair-dns.sh"
+  "systemd/tolaria.service"
+  "nginx/tolaria.conf"
+)
+
+msg_info "Lade Packaging-Dateien ..."
+if [[ -n "${TOLARIA_PACKAGING_DIR:-}" ]]; then
+  for rel in "${PACKAGING_FILES[@]}"; do
+    src="${TOLARIA_PACKAGING_DIR}/${rel}"
+    [[ -f "$src" ]] || { msg_error "Packaging-Datei fehlt: $src"; exit 1; }
+    cp "$src" "$PKG_DIR/$(basename "$rel")"
+  done
+  msg_ok "Packaging aus lokalem Verzeichnis: $TOLARIA_PACKAGING_DIR"
+else
+  for rel in "${PACKAGING_FILES[@]}"; do
+    url="${INSTALLER_RAW}/${rel}"
+    out="$PKG_DIR/$(basename "$rel")"
+    if ! wget -qO "$out" --timeout=30 --tries=3 "$url"; then
+      msg_error "Download fehlgeschlagen: $url"
+      msg_error "Prüfe Internet/DNS auf dem Proxmox-Host oder setze TOLARIA_PACKAGING_DIR auf einen lokalen Checkout."
+      exit 1
+    fi
+    [[ -s "$out" ]] || { msg_error "Download ist leer: $url"; exit 1; }
+  done
+  msg_ok "Packaging von ${INSTALLER_RAW} geladen."
 fi
 
 # ---------------------------------------------------------------------------
@@ -377,6 +513,7 @@ else
     --net0 "name=eth0,bridge=${BRIDGE},ip=dhcp"
     --ostype debian
     --unprivileged "$UNPRIVILEGED"
+    --nameserver "$CT_DNS"
     --onboot 1
     --start 0
     --password "$ROOT_PASSWORD"
@@ -408,7 +545,7 @@ msg_ok "Container $CTID läuft."
 msg_info "Warte auf das Container-Netzwerk (Default-Route) ..."
 network_ok=0
 for i in $(seq 1 30); do
-  if pct exec "$CTID" -- bash -lc 'ip -4 route | grep -q "^default"' >/dev/null 2>&1; then
+  if pct exec "$CTID" -- ip -4 route 2>/dev/null | grep -q '^default'; then
     network_ok=1
     break
   fi
@@ -417,7 +554,62 @@ done
 if [[ "$network_ok" == "1" ]]; then
   msg_ok "Container-Netzwerk ist bereit."
 else
-  msg_warn "Keine Default-Route nach 60 s sichtbar - apt-get versucht es trotzdem."
+  msg_warn "Keine Default-Route nach 60 s sichtbar - prüfe Bridge/DHCP (pct config ${CTID}, ip addr)."
+fi
+
+# ---------------------------------------------------------------------------
+# DNS im Container: prüfen und bei Bedarf reparieren
+# ---------------------------------------------------------------------------
+# Genau hier ist der häufigste Installationsfehler: Der CT hat eine Route,
+# aber /etc/resolv.conf zeigt (via Proxmox übernommen) auf 127.0.0.53.
+# Ohne diesen Schritt scheitert apt-get mit "Temporary failure resolving".
+msg_info "Prüfe DNS-Auflösung im Container ..."
+pct push "$CTID" "$PKG_DIR/repair-dns.sh" /root/tolaria-repair-dns.sh
+pct exec "$CTID" -- chmod 755 /root/tolaria-repair-dns.sh
+
+dns_was_broken=0
+if ! pct exec "$CTID" -- getent hosts deb.debian.org >/dev/null 2>&1; then
+  dns_was_broken=1
+fi
+
+if ! pct exec "$CTID" -- bash /root/tolaria-repair-dns.sh --servers "$CT_DNS"; then
+  msg_error "DNS-Auflösung im Container funktioniert nicht - Installation abgebrochen."
+  msg_error "Aktuelle /etc/resolv.conf im Container:"
+  pct exec "$CTID" -- cat /etc/resolv.conf 2>&1 || true
+  msg_error ""
+  msg_error "Manuelle Reparatur auf dem Proxmox-Host:"
+  msg_error "  pct set ${CTID} --nameserver \"${CT_DNS}\""
+  msg_error "  pct exec ${CTID} -- bash -c 'printf \"nameserver ${CT_DNS%% *}\\n\" > /etc/resolv.conf'"
+  msg_error "  pct reboot ${CTID}"
+  msg_error "Falls das LAN keinen öffentlichen DNS erlaubt: --dns \"<LAN-DNS>\" verwenden."
+  exit 1
+fi
+
+# Nameserver dauerhaft in der CT-Config hinterlegen, damit ein Reboot des
+# Containers die reparierte /etc/resolv.conf nicht wieder überschreibt.
+# Wichtig: repair-dns.sh kann auf den Fallback ausgewichen sein. Deshalb
+# werden die Nameserver aus der jetzt funktionierenden /etc/resolv.conf
+# gelesen und nicht blind die ursprünglich ermittelten $CT_DNS gesetzt.
+if [[ "$dns_was_broken" == "1" ]]; then
+  msg_info "Hinterlege Nameserver dauerhaft in der CT-Config ..."
+  CT_DNS_EFFECTIVE="$(pct exec "$CTID" -- awk '/^nameserver[[:space:]]/ {printf "%s ", $2}' /etc/resolv.conf 2>/dev/null \
+    | tr -d '\r\n' | sed 's/[[:space:]]*$//')"
+  if [[ -z "$CT_DNS_EFFECTIVE" ]]; then
+    msg_warn "Konnte Nameserver nicht aus dem Container lesen - nutze '${CT_DNS}'."
+    CT_DNS_EFFECTIVE="$CT_DNS"
+  fi
+  if [[ "$CT_DNS_EFFECTIVE" != "$CT_DNS" ]]; then
+    msg_warn "Im Container aktiv: '${CT_DNS_EFFECTIVE}' (angefragt: '${CT_DNS}')."
+  fi
+  if pct set "$CTID" --nameserver "$CT_DNS_EFFECTIVE"; then
+    CT_DNS="$CT_DNS_EFFECTIVE"
+    msg_ok "DNS repariert (Nameserver: ${CT_DNS})."
+  else
+    msg_warn "pct set --nameserver fehlgeschlagen - /etc/resolv.conf bleibt bis zum nächsten Start repariert."
+    msg_warn "Manuell: pct set ${CTID} --nameserver \"${CT_DNS_EFFECTIVE}\""
+  fi
+else
+  msg_ok "DNS im Container ist bereits in Ordnung."
 fi
 
 # ---------------------------------------------------------------------------
@@ -472,45 +664,14 @@ fi
   || { msg_error "Das Basic-Auth-Passwort enthält nicht unterstützte Zeichen. Erlaubt: A-Z a-z 0-9 . _ ~ @ % + = : , / -"; exit 1; }
 
 # ---------------------------------------------------------------------------
-# Packaging-Dateien: aus Repo laden (oder lokal für Tests)
+# Installationsvariablen (Packaging wurde bereits vor dem CT-Start geladen)
 # ---------------------------------------------------------------------------
-PKG_DIR="$(mktemp -d /tmp/tolaria-packaging.XXXXXX)"
-cleanup() {
-  rm -rf "$PKG_DIR" 2>/dev/null || true
-}
-trap cleanup EXIT
-
-PACKAGING_FILES=(
-  "scripts/setup-in-container.sh"
-  "scripts/inject-web-config.py"
-  "scripts/seed-vault.sh"
-  "systemd/tolaria.service"
-  "nginx/tolaria.conf"
-)
-
-msg_info "Lade Packaging-Dateien ..."
-if [[ -n "${TOLARIA_PACKAGING_DIR:-}" ]]; then
-  for rel in "${PACKAGING_FILES[@]}"; do
-    src="${TOLARIA_PACKAGING_DIR}/${rel}"
-    [[ -f "$src" ]] || { msg_error "Packaging-Datei fehlt: $src"; exit 1; }
-    cp "$src" "$PKG_DIR/$(basename "$rel")"
-  done
-  msg_ok "Packaging aus lokalem Verzeichnis: $TOLARIA_PACKAGING_DIR"
-else
-  for rel in "${PACKAGING_FILES[@]}"; do
-    url="${INSTALLER_RAW}/${rel}"
-    out="$PKG_DIR/$(basename "$rel")"
-    if ! wget -qO "$out" "$url"; then
-      msg_error "Download fehlgeschlagen: $url"
-      exit 1
-    fi
-    [[ -s "$out" ]] || { msg_error "Download ist leer: $url"; exit 1; }
-  done
-  msg_ok "Packaging von ${INSTALLER_RAW} geladen."
-fi
+[[ -n "${PKG_DIR:-}" && -d "$PKG_DIR" ]] \
+  || { msg_error "Packaging-Verzeichnis fehlt (interner Fehler)."; exit 1; }
 
 INSTALL_ENV="$PKG_DIR/install.env"
 {
+  printf 'CTID=%q\n' "$CTID"
   printf 'APP=%q\n' "$APP"
   printf 'PORT=%q\n' "$PORT"
   printf 'SERVER_PORT=%q\n' "$SERVER_PORT"
@@ -519,6 +680,8 @@ INSTALL_ENV="$PKG_DIR/install.env"
   printf 'TOLARIA_TOKEN=%q\n' "$TOLARIA_TOKEN"
   printf 'AUTH_USER=%q\n' "$AUTH_USER"
   printf 'AUTH_PASS=%q\n' "$AUTH_PASS"
+  printf 'TOLARIA_DNS_SERVERS=%q\n' "$CT_DNS"
+  printf 'FORCE_BUILD=%q\n' "$FORCE_BUILD"
 } > "$INSTALL_ENV"
 chmod 600 "$INSTALL_ENV"
 
@@ -528,6 +691,8 @@ for rel in "${PACKAGING_FILES[@]}"; do
   base="$(basename "$rel")"
   pct push "$CTID" "$PKG_DIR/$base" "/root/tolaria-packaging/$base"
 done
+pct exec "$CTID" -- chmod 755 /root/tolaria-packaging/repair-dns.sh
+pct exec "$CTID" -- chmod 700 /root/tolaria-packaging/setup-in-container.sh /root/tolaria-packaging/seed-vault.sh
 pct push "$CTID" "$INSTALL_ENV" "/root/tolaria-packaging/install.env"
 pct exec "$CTID" -- chmod 600 /root/tolaria-packaging/install.env
 msg_ok "Packaging im Container: /root/tolaria-packaging"
@@ -536,7 +701,7 @@ msg_ok "Packaging im Container: /root/tolaria-packaging"
 # Installation IM Container
 # ---------------------------------------------------------------------------
 msg_info "Installiere ${APP_TITLE} im Container (Node-Build, Vault, systemd, nginx) ..."
-msg_info "Das kann beim ersten Lauf 10-25 Minuten dauern. Build-Log: /root/tolaria-build.log (im CT)."
+msg_info "Erster Lauf: 10-25 Minuten. Bei unverändertem Upstream-Commit wird der Build übersprungen. Build-Log: /root/tolaria-build.log (im CT)."
 pct exec "$CTID" -- bash /root/tolaria-packaging/setup-in-container.sh
 
 # install.env enthält Secrets und wird nach Erfolg entfernt.

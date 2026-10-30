@@ -73,6 +73,38 @@ PY
 then pass "Config-Tag steht vor </head>"; else fail "Config-Tag steht nicht vor </head>"; fi
 
 echo ""
+echo "== DNS-Reparatur =="
+DNS_CONF="$TMP_DIR/resolv.conf"
+run "repair-dns --help" bash "$REPO_ROOT/scripts/repair-dns.sh" --help
+bash "$REPO_ROOT/scripts/repair-dns.sh" --help > "$TMP_DIR/repair-help.txt"
+run "repair-dns --help nennt --fallback-servers" \
+  grep -q -- '--fallback-servers' "$TMP_DIR/repair-help.txt"
+run "repair-dns schreibt Nameserver" \
+  bash "$REPO_ROOT/scripts/repair-dns.sh" --servers "1.1.1.1 9.9.9.9" \
+    --resolv-conf "$DNS_CONF" --skip-check
+run "resolv.conf enthält 1.1.1.1" grep -qx 'nameserver 1.1.1.1' "$DNS_CONF"
+run "resolv.conf enthält 9.9.9.9" grep -qx 'nameserver 9.9.9.9' "$DNS_CONF"
+run "resolv.conf enthält options" grep -q '^options ' "$DNS_CONF"
+if bash "$REPO_ROOT/scripts/repair-dns.sh" --servers "8.8.8.8 && echo pwned" \
+     --resolv-conf "$DNS_CONF" --skip-check >/dev/null 2>&1; then
+  fail "ungültiger Nameserver wird abgelehnt"
+else
+  pass "ungültiger Nameserver wird abgelehnt"
+fi
+if getent hosts deb.debian.org >/dev/null 2>&1; then
+  printf 'nameserver 203.0.113.1\n' > "$DNS_CONF"
+  bash "$REPO_ROOT/scripts/repair-dns.sh" --servers "9.9.9.9" \
+    --resolv-conf "$DNS_CONF" >/dev/null 2>&1
+  if grep -qx 'nameserver 203.0.113.1' "$DNS_CONF"; then
+    pass "funktionierendes DNS wird nicht überschrieben"
+  else
+    fail "funktionierendes DNS wurde überschrieben"
+  fi
+else
+  echo "[SKIP] funktionierendes DNS wird nicht überschrieben (keine Auflösung auf dem Testhost)"
+fi
+
+echo ""
 echo "== Vault-Seeding (idempotent) =="
 SEED="$TMP_DIR/seed"
 VAULT="$TMP_DIR/vault.git"
@@ -105,6 +137,9 @@ run "Basic Auth für /" grep -q 'auth_basic "Tolaria"' "$TPL"
 run "WebSocket-Upgrade" grep -q 'proxy_set_header Upgrade' "$TPL"
 run "Proxy auf 127.0.0.1" grep -q 'proxy_pass http://127.0.0.1:__SERVER_PORT__' "$TPL"
 run "Healthcheck öffentlich" grep -q 'location = /healthz' "$TPL"
+run "Healthcheck proxied zum Server" grep -q 'proxy_pass http://127.0.0.1:__SERVER_PORT__/healthz' "$TPL"
+run "gzip aktiv" grep -q '^    gzip on;' "$TPL"
+run "Asset-Caching" grep -q 'location /assets/' "$TPL"
 run "Config-JS no-store" grep -q 'no-store' "$TPL"
 if python3 - "$TPL" <<'PY'
 import re
@@ -139,6 +174,24 @@ ok = (
 raise SystemExit(0 if ok else 1)
 PY
 then pass "nginx: Basic nur UI/Config, nicht /v1/, Klammern balanciert"; else fail "nginx: Auth-Bloecke oder Klammern falsch"; fi
+
+if command -v nginx >/dev/null 2>&1; then
+  NGX="$TMP_DIR/nginx"
+  mkdir -p "$NGX/conf" "$NGX/logs"
+  sed -e 's|__PORT__|18080|g' -e 's|__SERVER_PORT__|18787|g' "$TPL" > "$NGX/conf/tolaria.conf"
+  cat > "$NGX/conf/nginx.conf" <<EOF
+pid $NGX/nginx.pid;
+error_log $NGX/logs/error.log;
+events { worker_connections 16; }
+http {
+  access_log off;
+  include $NGX/conf/tolaria.conf;
+}
+EOF
+  run "nginx -t mit gerendertem Template" nginx -p "$NGX" -c "$NGX/conf/nginx.conf" -t
+else
+  echo "[SKIP] nginx nicht installiert"
+fi
 
 echo ""
 echo "== systemd-Unit =="
@@ -190,12 +243,46 @@ else
 fi
 
 echo ""
+echo "== DNS / apt-Härtung =="
+HOST_INST="$REPO_ROOT/install/tolaria.sh"
+CT_SETUP="$REPO_ROOT/scripts/setup-in-container.sh"
+run "Host: DNS-Erkennung" grep -q 'detect_dns_servers' "$HOST_INST"
+run "Host: Nameserver dauerhaft in CT-Config" grep -Fq 'pct set "$CTID" --nameserver' "$HOST_INST"
+run "Host: persistiert effektive CT-Nameserver" grep -Fq 'CT_DNS_EFFECTIVE' "$HOST_INST"
+run "Host: liest Nameserver aus CT-resolv.conf" grep -Fq "awk '/^nameserver" "$HOST_INST"
+run "Host: repair-dns.sh wird in den CT gepusht" grep -q 'repair-dns.sh' "$HOST_INST"
+run "Host: Nameserver beim pct create" grep -q -- '--nameserver "\$CT_DNS"' "$HOST_INST"
+run "Setup: DNS-Guard vor apt" grep -q 'repair-dns.sh.*--servers' "$CT_SETUP"
+run "Setup: apt-Fetch-Fehler werden erkannt" grep -q 'Failed to fetch' "$CT_SETUP"
+run "Setup: apt-Retries" grep -q 'Acquire::Retries' "$CT_SETUP"
+if grep -q 'apt-get update -qq' "$CT_SETUP"; then
+  fail "Setup: apt-get update -qq (Fehler würden ignoriert)"
+else
+  pass "Setup: kein stilles apt-get update -qq"
+fi
+run "Setup: Build-Skip bei unverändertem Commit" grep -q 'NEED_BUILD' "$CT_SETUP"
+run "Setup: FORCE_BUILD" grep -q 'FORCE_BUILD' "$CT_SETUP"
+run "README: Troubleshooting DNS" grep -q "Temporary failure resolving" "$REPO_ROOT/README.md"
+
+echo ""
 echo "== Installer-Dry-Run / Hilfe =="
 run "installer --help" bash "$REPO_ROOT/install/tolaria.sh" --help
 run "installer --dry-run" bash "$REPO_ROOT/install/tolaria.sh" --dry-run --ctid 150
 DRY="$(bash "$REPO_ROOT/install/tolaria.sh" --dry-run --ctid 150 2>&1)"
 if grep -q 'CT-ID            : 150' <<<"$DRY"; then pass "Dry-Run zeigt CT-ID"; else fail "Dry-Run zeigt CT-ID"; fi
 if grep -q '10-25 Minuten' <<<"$DRY"; then pass "Dry-Run nennt Build-Dauer"; else fail "Dry-Run nennt Build-Dauer"; fi
+if grep -q 'Nameserver (CT)' <<<"$DRY"; then pass "Dry-Run zeigt Nameserver"; else fail "Dry-Run zeigt Nameserver"; fi
+if grep -q 'Build erzwingen' <<<"$DRY"; then pass "Dry-Run zeigt Force-Build"; else fail "Dry-Run zeigt Force-Build"; fi
+if bash "$REPO_ROOT/install/tolaria.sh" --help 2>&1 | grep -q -- '--force-build'; then
+  pass "--help nennt --force-build"
+else
+  fail "--help nennt --force-build"
+fi
+if bash "$REPO_ROOT/install/tolaria.sh" --dry-run --dns "8.8.8.8 && id" >/dev/null 2>&1; then
+  fail "ungültige --dns wird abgelehnt"
+else
+  pass "ungültige --dns wird abgelehnt"
+fi
 
 echo ""
 echo "=================================================="
