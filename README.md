@@ -284,7 +284,7 @@ DNS_SERVERS="192.168.1.1" bash /tmp/tolaria.sh
 
 Die Build-Schritte liefen früher über `bash -lc`. Eine Login-Shell liest `/etc/profile`; ist die Datei für den `tolaria`-User nicht lesbar, bricht die Profilauswertung ab und der `PATH` geht verloren. Der Installer setzt `/etc/profile` deshalb auf 644, ruft `pnpm` über den absolut ermittelten Pfad auf und nutzt `bash -c` mit explizitem `PATH` statt einer Login-Shell.
 
-Zusätzlich erbt `npm install -g` das restriktive `umask 077` des Setups und legt `pnpm` als `root:root` mit Modus 600 an. Der Build läuft aber als `tolaria` und bekommt dann `Permission denied`. Der Installer installiert pnpm deshalb mit `umask 022` und setzt die Rechte auf der pnpm-Installation anschließend explizit auf lesbar/ausführbar.
+Zusätzlich lief das Setup früher mit `umask 077`. Dadurch legten Paket-Postinsts und `npm install -g` Dateien wie `/etc/ssl/openssl.cnf` oder `pnpm` als `root:root` mit Modus 600 an; der Build-Benutzer `tolaria` bekam `Permission denied`. Das Setup nutzt jetzt `umask 022`, setzt sensible Dateien explizit auf 600/640 und korrigiert die Rechte von pnpm, `/etc/ssl` und `/etc/ssl/openssl.cnf`.
 
 ### `fatal: not in a git directory` beim Vault-Seeding
 
@@ -413,6 +413,7 @@ In dieser Umgebung wurde **kein echter Proxmox-Host** ausgeführt. Validiert wur
 - Offizieller Node-22-Tarball als Fallback (SHA256-geprüft, nach `/usr/local`, systemd-Unit nutzt den tatsächlichen Pfad): Download und Extraktion funktional getestet
 - Vault-Seeding mit explizitem `--git-dir`/`--work-tree` und Bereinigung einer geerbten Git-Umgebung; funktional mit `GIT_DIR=/nonexistent` und dem echten `demo-vault-v2` getestet
 - pnpm/Build ohne Login-Shell, mit absolutem pnpm-Pfad und explizitem `PATH`
+- Dateirechte für Build-Benutzer: `umask 022`, pnpm ausführbar, `/etc/ssl/openssl.cnf` und CA-Bundle lesbar
 - Verifikation des Pins über `getent ahostsv4` plus `/etc/hosts`-Abgleich; apt versucht bei Fehlern zuerst erneut mit Pin und entfernt ihn erst für den letzten DNS-Versuch
 - Packaging als atomarer Tarball inkl. Cache-Buster und Raw-Fallback: lokaler Tarball, `file://`-Tarball und echter `codeload.github.com`-Download getestet
 - Persistenz der tatsächlich funktionierenden Nameserver in der CT-Config (statisch geprüft); wird jetzt auch bei bereits funktionierendem DNS geschrieben

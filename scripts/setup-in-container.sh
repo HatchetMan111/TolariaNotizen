@@ -5,13 +5,16 @@
 #
 set -euo pipefail
 set +x
-umask 077
+# Bewusst 022: Paket-Postinsts (openssl.cnf, CA-Zertifikate) und npm/pnpm
+# legen sonst Dateien als root:root 600 an, die der Build-Benutzer tolaria
+# nicht lesen kann. Sensible Dateien werden unten explizit auf 600/640 gesetzt.
+umask 022
 # Ein per Tarball installiertes Node liegt unter /usr/local/bin und muss bei
 # einem erneuten Lauf vor /usr/bin/node gefunden werden.
 export PATH="/usr/local/bin:/usr/local/sbin:${PATH}"
 
 APP="tolaria"
-SETUP_VERSION="2026-10-31.9"
+SETUP_VERSION="2026-10-31.10"
 BUILD_LOG="/root/tolaria-build.log"
 PKG_DIR="/root/tolaria-packaging"
 INSTALL_ENV="${PKG_DIR}/install.env"
@@ -660,6 +663,13 @@ else
   msg_error "Im Container prüfen: dpkg -l ca-certificates; update-ca-certificates --fresh"
   exit 1
 fi
+
+# Node/OpenSSL liest /etc/ssl/openssl.cnf. Ein restriktives umask eines
+# früheren Laufs kann die Datei auf 600 gesetzt haben; tolaria darf sie lesen.
+chmod 755 /etc/ssl 2>/dev/null || true
+chmod 755 /etc/ssl/certs 2>/dev/null || true
+chmod 644 /etc/ssl/openssl.cnf 2>/dev/null || true
+chmod 644 /etc/ssl/certs/ca-certificates.crt 2>/dev/null || true
 if retry 2 5 apt_update_once; then
   msg_ok "Paketlisten nach Keyring-Update aktualisiert."
 else
@@ -801,8 +811,8 @@ if ! command -v npm >/dev/null 2>&1; then
   exit 1
 fi
 msg_info "Installiere pnpm 10.33.0 global ..."
-# Das globale npm erbt sonst das umask 077 des Setups und legt pnpm als
-# root:root 600 an. Der Build läuft als tolaria und darf pnpm nicht ausführen.
+# pnpm muss für den Build-Benutzer tolaria lesbar/ausführbar sein.
+# npm mit explizitem umask 022 installieren und die Rechte danach prüfen.
 if ! retry 3 10 bash -c 'umask 022; npm install -g --no-fund --no-audit pnpm@10.33.0'; then
   msg_error "pnpm konnte nicht über npm installiert werden (Registry erreichbar?)."
   exit 1
@@ -937,7 +947,7 @@ else
   msg_info "Build übersprungen (unveränderter Commit). Mit --force-build erzwingen."
 fi
 
-# nginx (www-data) muss den Build lesen können; umask 077 hat restriktive Rechte erzeugt.
+# nginx (www-data) und der Build-Benutzer müssen den Build lesen können.
 chmod 755 /opt/tolaria /opt/tolaria/src /opt/tolaria/src/apps /opt/tolaria/src/apps/web "$DIST_DIR"
 chmod -R a+rX "$DIST_DIR"
 

@@ -597,6 +597,8 @@ run "Setup: Node-Tarball-Fallback vorhanden" grep -q 'install_node_tarball' "$CT
 run "Setup: pnpm wird absolut aufgerufen" grep -q "PNPM_BIN" "$CT_SETUP"
 run "Setup: pnpm mit umask 022 installiert" grep -q 'umask 022; npm install -g' "$CT_SETUP"
 run "Setup: pnpm-Rechte werden korrigiert" grep -q 'chmod -R a+rX' "$CT_SETUP"
+run "Setup: globales umask 022" grep -q '^umask 022$' "$CT_SETUP"
+run "Setup: openssl.cnf wird lesbar gemacht" grep -q 'chmod 644 /etc/ssl/openssl.cnf' "$CT_SETUP"
 run "Setup: Build ohne Login-Shell" grep -q 'bash -c "cd /opt/tolaria/src' "$CT_SETUP"
 run "Setup: systemd nutzt tatsächlichen node-Pfad" grep -q 'ExecStart=${NODE_BIN}' "$CT_SETUP"
 run "Host: Packaging als atomarer Tarball" grep -q 'codeload.github.com' "$HOST_INST"
