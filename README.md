@@ -280,6 +280,10 @@ DNS_SERVERS="192.168.1.1" bash /tmp/tolaria.sh
 
 `pct set --nameserver` ist wichtig: Ohne den Eintrag in der CT-Config schreibt Proxmox die kaputte Datei beim nächsten Start wieder. Der Installer ist idempotent: Bei einem vorhandenen Container genügt ein erneuter Lauf, er repariert DNS und den DHCP-Schutz automatisch.
 
+### `pnpm: command not found` / `/etc/profile: Permission denied`
+
+Die Build-Schritte liefen früher über `bash -lc`. Eine Login-Shell liest `/etc/profile`; ist die Datei für den `tolaria`-User nicht lesbar, bricht die Profilauswertung ab und der `PATH` geht verloren. Der Installer setzt `/etc/profile` deshalb auf 644, ruft `pnpm` über den absolut ermittelten Pfad auf und nutzt `bash -c` mit explizitem `PATH` statt einer Login-Shell.
+
 ### `fatal: not in a git directory` beim Vault-Seeding
 
 Das Seeding läuft in einem temporären Verzeichnis. Eine geerbte Git-Umgebung (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE` …) kann alle Git-Aufrufe auf ein fremdes Repository umbiegen; `git init` wirkt dann erfolgreich, aber `git config` scheitert. `seed-vault.sh` entfernt diese Variablen, nutzt explizite `--git-dir`/`--work-tree`-Pfade und prüft direkt nach `git init`, ob `.git` wirklich existiert. Bei einem Fehler nennt der ERR-Trap die exakte Zeile und den Befehl.
@@ -406,6 +410,7 @@ In dieser Umgebung wurde **kein echter Proxmox-Host** ausgeführt. Validiert wur
 - CA-/Keyring-Reparatur vor NodeSource (`ca-certificates`, `debian-archive-keyring`, `update-ca-certificates --fresh`)
 - Offizieller Node-22-Tarball als Fallback (SHA256-geprüft, nach `/usr/local`, systemd-Unit nutzt den tatsächlichen Pfad): Download und Extraktion funktional getestet
 - Vault-Seeding mit explizitem `--git-dir`/`--work-tree` und Bereinigung einer geerbten Git-Umgebung; funktional mit `GIT_DIR=/nonexistent` und dem echten `demo-vault-v2` getestet
+- pnpm/Build ohne Login-Shell, mit absolutem pnpm-Pfad und explizitem `PATH`
 - Verifikation des Pins über `getent ahostsv4` plus `/etc/hosts`-Abgleich; apt versucht bei Fehlern zuerst erneut mit Pin und entfernt ihn erst für den letzten DNS-Versuch
 - Packaging als atomarer Tarball inkl. Cache-Buster und Raw-Fallback: lokaler Tarball, `file://`-Tarball und echter `codeload.github.com`-Download getestet
 - Persistenz der tatsächlich funktionierenden Nameserver in der CT-Config (statisch geprüft); wird jetzt auch bei bereits funktionierendem DNS geschrieben

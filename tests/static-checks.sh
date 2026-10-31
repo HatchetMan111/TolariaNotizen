@@ -594,6 +594,8 @@ run "Setup: CA-Bundle wird geprüft" grep -q '/etc/ssl/certs/ca-certificates.crt
 run "Setup: Debian-Keyring wird repariert" grep -q 'debian-archive-keyring' "$CT_SETUP"
 run "Setup: NodeSource nutzt den Proxy" grep -q 'https_proxy=' "$CT_SETUP"
 run "Setup: Node-Tarball-Fallback vorhanden" grep -q 'install_node_tarball' "$CT_SETUP"
+run "Setup: pnpm wird absolut aufgerufen" grep -q "PNPM_BIN" "$CT_SETUP"
+run "Setup: Build ohne Login-Shell" grep -q 'bash -c "cd /opt/tolaria/src' "$CT_SETUP"
 run "Setup: systemd nutzt tatsächlichen node-Pfad" grep -q 'ExecStart=${NODE_BIN}' "$CT_SETUP"
 run "Host: Packaging als atomarer Tarball" grep -q 'codeload.github.com' "$HOST_INST"
 run "Host: Cache-Buster fuer Downloads" grep -q 'cache_busted_url' "$HOST_INST"

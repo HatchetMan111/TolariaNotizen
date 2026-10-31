@@ -11,7 +11,7 @@ umask 077
 export PATH="/usr/local/bin:/usr/local/sbin:${PATH}"
 
 APP="tolaria"
-SETUP_VERSION="2026-10-31.7"
+SETUP_VERSION="2026-10-31.8"
 BUILD_LOG="/root/tolaria-build.log"
 PKG_DIR="/root/tolaria-packaging"
 INSTALL_ENV="${PKG_DIR}/install.env"
@@ -807,7 +807,14 @@ if ! retry 3 10 npm install -g --no-fund --no-audit pnpm@10.33.0; then
 fi
 pnpm_version="$(pnpm --version)"
 [[ "$pnpm_version" == "10.33.0" ]] || { msg_error "pnpm-Version ist ${pnpm_version}, erwartet 10.33.0"; exit 1; }
-msg_ok "pnpm ${pnpm_version}"
+PNPM_BIN="$(command -v pnpm || true)"
+[[ -n "$PNPM_BIN" ]] || { msg_error "pnpm ist nach der Installation nicht im PATH."; exit 1; }
+msg_ok "pnpm ${pnpm_version} (${PNPM_BIN})"
+
+# Ein restriktives /etc/profile darf keinen Login-Shell-Build verhindern.
+if [[ -e /etc/profile ]]; then
+  chmod 644 /etc/profile 2>/dev/null || true
+fi
 
 # ---------------------------------------------------------------------------
 # Benutzer und Verzeichnisse
@@ -893,7 +900,7 @@ if [[ "$NEED_BUILD" == "1" ]]; then
     HUSKY=0 \
     CI=1 \
     NODE_OPTIONS="--max-old-space-size=4096" \
-    bash -lc 'cd /opt/tolaria/src && pnpm install --frozen-lockfile'; then
+    bash -c "cd /opt/tolaria/src && '${PNPM_BIN}' install --frozen-lockfile"; then
     msg_error "pnpm install ist fehlgeschlagen (Registry/Netzwerk oder Lockfile)."
     exit 1
   fi
@@ -904,7 +911,7 @@ if [[ "$NEED_BUILD" == "1" ]]; then
     PATH="/usr/local/bin:/usr/bin:/bin" \
     CI=1 \
     NODE_OPTIONS="--max-old-space-size=4096" \
-    bash -lc 'cd /opt/tolaria/src && pnpm build:web'; then
+    bash -c "cd /opt/tolaria/src && '${PNPM_BIN}' build:web"; then
     msg_error "pnpm build:web ist fehlgeschlagen (siehe ${BUILD_LOG})."
     exit 1
   fi
