@@ -28,6 +28,13 @@ SERVER_PORT="8787"                              # Tolaria-Server, nur 127.0.0.1
 UPSTREAM_REPO="https://github.com/refactoringhq/tolaria.git"
 UPSTREAM_REF="${TOLARIA_REF:-main}"
 INSTALLER_RAW="${TOLARIA_RAW_BASE:-https://raw.githubusercontent.com/HatchetMan111/TolariaNotizen/main}"
+# Packaging wird bevorzugt als ein atomarer Tarball geladen. Einzelne
+# Raw-Dateien können unterschiedlich lange im CDN-Cache liegen; dann passen
+# Host-Skript und Container-Skripte nicht zusammen (genau das ist bei einem
+# realen Lauf passiert). Der Tarball enthält dagegen einen konsistenten Stand.
+INSTALLER_REPO_SLUG="${TOLARIA_REPO_SLUG:-HatchetMan111/TolariaNotizen}"
+PACKAGING_REF="${TOLARIA_PACKAGING_REF:-main}"
+PACKAGING_TARBALL="${TOLARIA_PACKAGING_TARBALL:-}"
 
 DEFAULT_CORES="${CORES:-4}"                     # vCPU (Build ist CPU-hungrig)
 DEFAULT_RAM="${RAM:-6144}"                      # MB (tsc + vite brauchen Luft)
@@ -72,7 +79,10 @@ ${APP_TITLE} Proxmox LXC Installer
 Usage:
   bash tolaria.sh [OPTIONEN]
   CT_ID=150 bash tolaria.sh
-  bash -c "\$(wget -qLO - ${INSTALLER_RAW}/install/tolaria.sh)"
+  wget -qO /tmp/tolaria.sh '${INSTALLER_RAW}/install/tolaria.sh?cb='\$(date +%s) && bash /tmp/tolaria.sh
+
+Hinweis: Der Cache-Buster ('?cb=...') verhindert, dass ein veraltetes
+Skript aus dem GitHub-CDN ausgeführt wird.
 
 Optionen:
   --ctid ID            Container-ID (Default: nächste freie ID via 'pvesh get /cluster/nextid')
@@ -95,6 +105,11 @@ Optionen:
   --debug, -x          Trace bis zur Secret-Erzeugung + maximale Fehlerkette
   --dry-run            Nur Plan/Argumente ausgeben, nichts verändern
   --help, -h           diese Hilfe
+
+Umgebung:
+  TOLARIA_PACKAGING_REF       Branch/Tag/Commit für den Packaging-Tarball (Default: main)
+  TOLARIA_PACKAGING_TARBALL   Eigene Tarball-URL oder lokaler Pfad
+  TOLARIA_PACKAGING_DIR       Lokaler Checkout statt Download
 
 Nach der Installation:
   Web UI: http://<LXC-IP>:${PORT}
@@ -183,6 +198,8 @@ on_error() {
       pct exec "${CTID}" -- bash -c 'getent ahostsv6 deb.debian.org || echo "IPv6-Aufloesung fehlgeschlagen"' 2>&1 || true
       pct exec "${CTID}" -- bash -c 'ip -4 route 2>/dev/null; ip -4 addr show dev eth0 2>/dev/null' 2>&1 || true
       pct exec "${CTID}" -- bash -c 'if [ -f /etc/dhcp/dhclient.conf ]; then grep -n "tolaria-dns\|domain-name-servers" /etc/dhcp/dhclient.conf || true; fi' 2>&1 || true
+      pct exec "${CTID}" -- bash -c 'if [ -f /etc/hosts ]; then grep -A6 -F "# >>> tolaria-apt-hosts >>>" /etc/hosts || true; fi' 2>&1 || true
+      pct exec "${CTID}" -- bash -c 'if [ -f /root/tolaria-apt-update.log ]; then tail -n 30 /root/tolaria-apt-update.log || true; fi' 2>&1 || true
       echo ""
       msg_error "--- systemctl status ${APP} ---"
       pct exec "${CTID}" -- systemctl status "${APP}" --no-pager --full 2>&1 || true
@@ -262,6 +279,7 @@ if [[ -n "$AUTH_PASS" ]]; then
     || { msg_error "AUTH_PASS enthält nicht unterstützte Zeichen. Erlaubt: A-Z a-z 0-9 . _ ~ @ % + = : , / -"; exit 1; }
 fi
 [[ "$REF" =~ ^[A-Za-z0-9._/][A-Za-z0-9._/-]*$ ]] || { msg_error "REF ungültig: $REF"; exit 1; }
+[[ "$PACKAGING_REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { msg_error "TOLARIA_PACKAGING_REF ungültig: $PACKAGING_REF"; exit 1; }
 [[ "$FORCE_BUILD" =~ ^[01]$ ]] || { msg_error "FORCE_BUILD muss 0 oder 1 sein."; exit 1; }
 if [[ -n "$DNS_SERVERS" ]]; then
   read -r -a DNS_ARRAY <<< "$DNS_SERVERS"
@@ -301,6 +319,7 @@ ${APP_TITLE} - Dry Run (es wird nichts verändert)
   Basic-Auth-User  : ${AUTH_USER}
   Build erzwingen  : ${FORCE_BUILD}
   Installer-Repo   : ${INSTALLER_RAW}
+  Packaging        : ${PACKAGING_TARBALL:-Tarball ${INSTALLER_REPO_SLUG} @ ${PACKAGING_REF}}
 
 Ablauf:
   1. Template ${DEFAULT_OS} sicherstellen
@@ -340,7 +359,7 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   msg_error "Bitte als root auf dem Proxmox-Host ausführen (sudo -i)."
   exit 1
 fi
-for bin in pct pveam pvesh pvesm wget curl openssl; do
+for bin in pct pveam pvesh pvesm wget curl openssl tar; do
   if ! command -v "$bin" >/dev/null 2>&1; then
     msg_error "Benötigtes Tool fehlt: $bin - läuft das Skript wirklich auf einem Proxmox-VE-Host?"
     exit 1
@@ -454,27 +473,145 @@ PACKAGING_FILES=(
   "nginx/tolaria.conf"
 )
 
+# >>> tolaria-packaging-fetch >>>
+# Cache-Buster: raw.githubusercontent.com und codeload.github.com liefern
+# "main" über ein CDN. Ohne eindeutige URL kann ein Lauf noch die vorherige
+# Version sehen (genau das hat den gemeldeten Fehlschlag verursacht).
+cache_busted_url() {
+  local url="$1"
+  if [[ "$url" == *\?* ]]; then
+    printf '%s&cb=%s' "$url" "$(date +%s)"
+  else
+    printf '%s?cb=%s' "$url" "$(date +%s)"
+  fi
+}
+
+download_packaging_file() {
+  local url="$1" out="$2"
+  if [[ -f "$url" ]]; then
+    cp -- "$url" "$out"
+  elif [[ "$url" == file://* ]]; then
+    cp -- "${url#file://}" "$out"
+  else
+    wget -q --no-cache --header='Cache-Control: no-cache' \
+      -O "$out" --timeout=30 --tries=3 "$url"
+  fi
+}
+
+try_packaging_tarball_url() {
+  local url="$1" tar_file extract top rel tar_source
+
+  tar_file="$PKG_DIR/.packaging.tar.gz"
+  extract="$PKG_DIR/.extract"
+  rm -rf "$extract" "$tar_file"
+  mkdir -p "$extract"
+
+  tar_source="$url"
+  if [[ "$url" == http* ]]; then
+    tar_source="$(cache_busted_url "$url")"
+  fi
+  if ! download_packaging_file "$tar_source" "$tar_file"; then
+    return 1
+  fi
+  if ! tar -xzf "$tar_file" -C "$extract" 2>/dev/null; then
+    return 1
+  fi
+
+  # GitHub-Tarballs haben ein Top-Level-Verzeichnis; lokale Test-Tarballs
+  # eventuell nicht. Beides unterstützen.
+  if [[ ! -d "$extract/scripts" ]]; then
+    top="$(find "$extract" -mindepth 1 -maxdepth 1 -type d | head -n1 || true)"
+    [[ -n "$top" ]] && extract="$top"
+  fi
+
+  for rel in "${PACKAGING_FILES[@]}"; do
+    if [[ ! -s "$extract/$rel" ]]; then
+      return 1
+    fi
+    cp -- "$extract/$rel" "$PKG_DIR/$(basename "$rel")"
+  done
+  rm -rf "$extract" "$tar_file"
+  PACKAGING_SOURCE="$url"
+}
+
+fetch_packaging_tarball() {
+  local ref_path
+
+  if [[ -n "$PACKAGING_TARBALL" ]]; then
+    try_packaging_tarball_url "$PACKAGING_TARBALL"
+    return
+  fi
+
+  if [[ "$PACKAGING_REF" == refs/* ]]; then
+    try_packaging_tarball_url "https://codeload.github.com/${INSTALLER_REPO_SLUG}/tar.gz/${PACKAGING_REF}"
+    return
+  fi
+
+  # Commit-SHA: codeload akzeptiert ihn direkt.
+  if [[ "$PACKAGING_REF" =~ ^[0-9a-fA-F]{7,40}$ ]]; then
+    try_packaging_tarball_url "https://codeload.github.com/${INSTALLER_REPO_SLUG}/tar.gz/${PACKAGING_REF}" \
+      && return 0
+  fi
+
+  # Branch und Tag sind ohne API nicht unterscheidbar: beide probieren.
+  for ref_path in "refs/heads/${PACKAGING_REF}" "refs/tags/${PACKAGING_REF}"; do
+    try_packaging_tarball_url "https://codeload.github.com/${INSTALLER_REPO_SLUG}/tar.gz/${ref_path}" \
+      && return 0
+  done
+
+  msg_warn "Kein Tarball für Ref '${PACKAGING_REF}' gefunden (Branch/Tag/Commit geprüft)."
+  return 1
+}
+
+fetch_packaging_raw() {
+  local rel url out
+  for rel in "${PACKAGING_FILES[@]}"; do
+    url="$(cache_busted_url "${INSTALLER_RAW}/${rel}")"
+    out="$PKG_DIR/$(basename "$rel")"
+    if ! download_packaging_file "$url" "$out"; then
+      msg_error "Download fehlgeschlagen: $url"
+      return 1
+    fi
+    if [[ ! -s "$out" ]]; then
+      msg_error "Download ist leer: $url"
+      return 1
+    fi
+  done
+}
+# <<< tolaria-packaging-fetch <<<
+
 msg_info "Lade Packaging-Dateien ..."
 if [[ -n "${TOLARIA_PACKAGING_DIR:-}" ]]; then
   for rel in "${PACKAGING_FILES[@]}"; do
     src="${TOLARIA_PACKAGING_DIR}/${rel}"
     [[ -f "$src" ]] || { msg_error "Packaging-Datei fehlt: $src"; exit 1; }
-    cp "$src" "$PKG_DIR/$(basename "$rel")"
+    cp -- "$src" "$PKG_DIR/$(basename "$rel")"
   done
   msg_ok "Packaging aus lokalem Verzeichnis: $TOLARIA_PACKAGING_DIR"
 else
-  for rel in "${PACKAGING_FILES[@]}"; do
-    url="${INSTALLER_RAW}/${rel}"
-    out="$PKG_DIR/$(basename "$rel")"
-    if ! wget -qO "$out" --timeout=30 --tries=3 "$url"; then
-      msg_error "Download fehlgeschlagen: $url"
+  PACKAGING_SOURCE=""
+  if fetch_packaging_tarball; then
+    msg_ok "Packaging als konsistenter Tarball geladen: ${PACKAGING_SOURCE}"
+  else
+    PACKAGING_SOURCE=""
+    msg_warn "Tarball nicht verfügbar - weiche auf einzelne Raw-Dateien aus (Cache-Buster aktiv)."
+    if ! fetch_packaging_raw; then
+      msg_error "Packaging konnte nicht geladen werden."
       msg_error "Prüfe Internet/DNS auf dem Proxmox-Host oder setze TOLARIA_PACKAGING_DIR auf einen lokalen Checkout."
       exit 1
     fi
-    [[ -s "$out" ]] || { msg_error "Download ist leer: $url"; exit 1; }
-  done
-  msg_ok "Packaging von ${INSTALLER_RAW} geladen."
+    msg_ok "Packaging als einzelne Raw-Dateien geladen (${INSTALLER_RAW})."
+  fi
 fi
+
+# Zwei Dateien sind für den weiteren Ablauf zwingend. Ein früher, klarer
+# Fehler ist besser als ein halb installierter Container.
+for rel in "scripts/setup-in-container.sh" "scripts/repair-dns.sh"; do
+  [[ -s "$PKG_DIR/$(basename "$rel")" ]] \
+    || { msg_error "Packaging unvollständig: $rel fehlt."; exit 1; }
+done
+bash -n "$PKG_DIR/setup-in-container.sh" \
+  || { msg_error "Packaging fehlerhaft: setup-in-container.sh hat einen Syntaxfehler."; exit 1; }
 
 # ---------------------------------------------------------------------------
 # Container erstellen (idempotent: existiert die CT-ID, wiederverwenden)
@@ -591,29 +728,31 @@ fi
 
 # Nameserver dauerhaft in der CT-Config hinterlegen, damit ein Reboot des
 # Containers die reparierte /etc/resolv.conf nicht wieder überschreibt.
+# Das gilt auch dann, wenn DNS im Moment funktioniert: Ein späterer
+# DHCP-Lease kann die Datei erneut mit unbrauchbaren Servern füllen.
 # Wichtig: repair-dns.sh kann auf den Fallback ausgewichen sein. Deshalb
 # werden die Nameserver aus der jetzt funktionierenden /etc/resolv.conf
 # gelesen und nicht blind die ursprünglich ermittelten $CT_DNS gesetzt.
-if [[ "$dns_was_broken" == "1" ]]; then
-  msg_info "Hinterlege Nameserver dauerhaft in der CT-Config ..."
-  CT_DNS_EFFECTIVE="$(pct exec "$CTID" -- awk '/^nameserver[[:space:]]/ {printf "%s ", $2}' /etc/resolv.conf 2>/dev/null \
-    | tr -d '\r\n' | sed 's/[[:space:]]*$//')"
-  if [[ -z "$CT_DNS_EFFECTIVE" ]]; then
-    msg_warn "Konnte Nameserver nicht aus dem Container lesen - nutze '${CT_DNS}'."
-    CT_DNS_EFFECTIVE="$CT_DNS"
-  fi
-  if [[ "$CT_DNS_EFFECTIVE" != "$CT_DNS" ]]; then
-    msg_warn "Im Container aktiv: '${CT_DNS_EFFECTIVE}' (angefragt: '${CT_DNS}')."
-  fi
-  if pct set "$CTID" --nameserver "$CT_DNS_EFFECTIVE"; then
-    CT_DNS="$CT_DNS_EFFECTIVE"
+msg_info "Hinterlege Nameserver dauerhaft in der CT-Config ..."
+CT_DNS_EFFECTIVE="$(pct exec "$CTID" -- awk '/^nameserver[[:space:]]/ {printf "%s ", $2}' /etc/resolv.conf 2>/dev/null \
+  | tr -d '\r\n' | sed 's/[[:space:]]*$//')"
+if [[ -z "$CT_DNS_EFFECTIVE" ]]; then
+  msg_warn "Konnte Nameserver nicht aus dem Container lesen - nutze '${CT_DNS}'."
+  CT_DNS_EFFECTIVE="$CT_DNS"
+fi
+if [[ "$CT_DNS_EFFECTIVE" != "$CT_DNS" ]]; then
+  msg_warn "Im Container aktiv: '${CT_DNS_EFFECTIVE}' (angefragt: '${CT_DNS}')."
+fi
+if pct set "$CTID" --nameserver "$CT_DNS_EFFECTIVE"; then
+  CT_DNS="$CT_DNS_EFFECTIVE"
+  if [[ "$dns_was_broken" == "1" ]]; then
     msg_ok "DNS repariert (Nameserver: ${CT_DNS})."
   else
-    msg_warn "pct set --nameserver fehlgeschlagen - /etc/resolv.conf bleibt bis zum nächsten Start repariert."
-    msg_warn "Manuell: pct set ${CTID} --nameserver \"${CT_DNS_EFFECTIVE}\""
+    msg_ok "DNS im Container war in Ordnung und ist dauerhaft hinterlegt (${CT_DNS})."
   fi
 else
-  msg_ok "DNS im Container ist bereits in Ordnung."
+  msg_warn "pct set --nameserver fehlgeschlagen - /etc/resolv.conf bleibt bis zum nächsten Start repariert."
+  msg_warn "Manuell: pct set ${CTID} --nameserver \"${CT_DNS_EFFECTIVE}\""
 fi
 
 # ---------------------------------------------------------------------------

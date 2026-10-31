@@ -72,40 +72,64 @@ fi
 [[ "$RETRIES" =~ ^[0-9]+$ ]] && (( RETRIES >= 1 )) \
   || { msg_error "--retries muss eine positive Zahl sein."; exit 2; }
 
+# Hostnamen landen in /etc/hosts. Ohne Validierung könnte ein Aufrufer mit
+# --hosts Zeilenumbrüche oder zusätzliche Einträge einschleusen.
+for _host in $HOSTS; do
+  [[ "$_host" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] \
+    || { msg_error "Ungültiger Hostname: '$_host'"; exit 2; }
+done
+unset _host
+
 # Entfernt den Block in-place. /etc/hosts ist im LXC häufig ein Bind-Mount,
 # deshalb kein mv (das würde mit EBUSY scheitern).
 remove_block() {
   [[ -f "$HOSTS_FILE" ]] || return 0
   grep -qF "$MARK_BEGIN" "$HOSTS_FILE" || return 0
+  local tmp
+  tmp="$(mktemp "${HOSTS_FILE}.tolaria.XXXXXX")" || return 1
   awk -v b="$MARK_BEGIN" -v e="$MARK_END" '
     $0 == b { skip = 1; next }
     $0 == e { skip = 0; next }
     !skip
-  ' "$HOSTS_FILE" > "${HOSTS_FILE}.tolaria.tmp"
-  cat "${HOSTS_FILE}.tolaria.tmp" > "$HOSTS_FILE"
-  rm -f "${HOSTS_FILE}.tolaria.tmp"
+  ' "$HOSTS_FILE" > "$tmp"
+  cat "$tmp" > "$HOSTS_FILE"
+  rm -f "$tmp"
 }
 
 pin() {
-  local h ip attempt entries=()
+  local h ip attempt tail_hex out
+  local -a ips=() entries=()
   for h in $HOSTS; do
-    ip=""
-    for ((attempt = 1; attempt <= RETRIES; attempt++)); do
-      ip="$(getent ahostsv4 "$h" 2>/dev/null | awk 'NR==1 {print $1}')"
-      [[ -n "$ip" ]] && break
-      (( attempt < RETRIES )) && sleep 1
-    done
-    if [[ -n "$ip" ]]; then
-      entries+=("$ip $h")
+    mapfile -t ips < <(
+      for ((attempt = 1; attempt <= RETRIES; attempt++)); do
+        out="$(getent ahostsv4 "$h" 2>/dev/null | awk '{print $1}' | awk '!seen[$0]++' | head -n2)"
+        if [[ -n "$out" ]]; then
+          printf '%s\n' "$out"
+          break
+        fi
+        (( attempt < RETRIES )) && sleep 1
+      done
+    )
+    if (( ${#ips[@]} > 0 )); then
+      for ip in "${ips[@]}"; do
+        entries+=("$ip $h")
+      done
     else
       msg_warn "Konnte ${h} nicht auflösen - kein Pin für diesen Host."
     fi
   done
 
-  remove_block
+  remove_block || return 1
   if (( ${#entries[@]} == 0 )); then
-    msg_warn "Kein Host auflösbar - /etc/hosts bleibt unverändert."
+    msg_warn "Kein Host auflösbar - ${HOSTS_FILE} bleibt unverändert."
     return 1
+  fi
+
+  # /etc/hosts endet nicht immer mit Zeilenumbruch; sonst klebt der Marker
+  # an der letzten Zeile und wird beim nächsten unpin nicht gefunden.
+  if [[ -s "$HOSTS_FILE" ]]; then
+    tail_hex="$(tail -c 1 "$HOSTS_FILE" | od -An -t x1 | tr -d ' \n')"
+    [[ "$tail_hex" == "0a" ]] || printf '\n' >> "$HOSTS_FILE"
   fi
 
   {

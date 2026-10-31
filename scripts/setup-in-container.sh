@@ -55,6 +55,16 @@ on_error() {
   if [[ -f /etc/dhcp/dhclient.conf ]]; then
     grep -n 'tolaria-dns\|domain-name-servers' /etc/dhcp/dhclient.conf 2>&1 || true
   fi
+  if [[ -f /etc/hosts ]] && grep -qF '# >>> tolaria-apt-hosts >>>' /etc/hosts; then
+    echo ""
+    msg_error "--- /etc/hosts (apt-Pin-Block) ---"
+    grep -A6 -F '# >>> tolaria-apt-hosts >>>' /etc/hosts 2>&1 || true
+  fi
+  if [[ -f /root/tolaria-apt-update.log ]]; then
+    echo ""
+    msg_error "--- apt-Update-Log (letzte 40 Zeilen) ---"
+    tail -n 40 /root/tolaria-apt-update.log 2>&1 || true
+  fi
   echo ""
   msg_error "--- nginx -t ---"
   nginx -t 2>&1 || true
@@ -115,7 +125,12 @@ APT_PACKAGES=(
   ca-certificates curl gnupg git build-essential python3
   nginx apache2-utils openssl procps iproute2
 )
-APT_OPTS=(-o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+APT_OPTS=(
+  -o Acquire::Retries=5
+  -o Acquire::http::Timeout=30
+  -o Acquire::https::Timeout=30
+  -o DPkg::Lock::Timeout=120
+)
 APT_LOG="/root/tolaria-apt-update.log"
 
 # In einem Container ohne globales IPv6 wartet apt sonst lange auf AAAA-
@@ -189,24 +204,101 @@ TOLARIA_DNS_SERVERS="$EFFECTIVE_DNS"
 # Rate-Limits). "Temporary failure resolving" trotz funktionierendem getent
 # ist dann die Folge. Die apt-Hosts werden deshalb für die Dauer der
 # Paketinstallation in /etc/hosts gepinnt und danach wieder entfernt.
+#
+# Wichtig: Das Pinning darf NICHT davon abhängen, dass apt-hosts-pin.sh im
+# Container angekommen ist. Genau daran ist ein realer Lauf gescheitert: Das
+# (noch alte) Host-Skript hat die Datei nicht mitgepusht, das (neue) Setup
+# fand sie nicht und fiel still auf DNS zurück. Deshalb gibt es hier einen
+# eingebauten Fallback, der /etc/hosts selbst schreibt.
+# >>> tolaria-inline-pin >>>
 APT_HOSTS_PIN="${PKG_DIR}/apt-hosts-pin.sh"
 APT_HOSTS_PINNED=0
+APT_HOSTS_FILE="${APT_HOSTS_FILE:-/etc/hosts}"
+APT_HOSTS_BEGIN="# >>> tolaria-apt-hosts >>>"
+APT_HOSTS_END="# <<< tolaria-apt-hosts <<<"
+APT_HOSTS_LIST="deb.debian.org security.debian.org deb.nodesource.com"
+
+apt_hosts_remove_block() {
+  [[ -f "$APT_HOSTS_FILE" ]] || return 0
+  grep -qF "$APT_HOSTS_BEGIN" "$APT_HOSTS_FILE" || return 0
+  local tmp
+  tmp="$(mktemp "${APT_HOSTS_FILE}.tolaria.XXXXXX")" || return 1
+  awk -v b="$APT_HOSTS_BEGIN" -v e="$APT_HOSTS_END" '
+    $0 == b { skip = 1; next }
+    $0 == e { skip = 0; next }
+    !skip
+  ' "$APT_HOSTS_FILE" > "$tmp"
+  cat "$tmp" > "$APT_HOSTS_FILE"
+  rm -f "$tmp"
+}
+
+apt_hosts_pin_inline() {
+  local h ip tail_hex
+  local -a ips=() entries=()
+  for h in $APT_HOSTS_LIST; do
+    mapfile -t ips < <(getent ahostsv4 "$h" 2>/dev/null \
+      | awk '{print $1}' | awk '!seen[$0]++' | head -n2)
+    if (( ${#ips[@]} == 0 )); then
+      msg_warn "Konnte ${h} nicht auflösen - kein Pin für diesen Host."
+      continue
+    fi
+    for ip in "${ips[@]}"; do entries+=("$ip $h"); done
+  done
+  (( ${#entries[@]} > 0 )) || return 1
+  apt_hosts_remove_block || return 1
+  # /etc/hosts endet nicht immer mit einem Zeilenumbruch. Ohne diese Prüfung
+  # würde der Marker an die letzte Zeile angeklebt und nie wieder erkannt.
+  if [[ -s "$APT_HOSTS_FILE" ]]; then
+    tail_hex="$(tail -c 1 "$APT_HOSTS_FILE" | od -An -t x1 | tr -d ' \n')"
+    [[ "$tail_hex" == "0a" ]] || printf '\n' >> "$APT_HOSTS_FILE"
+  fi
+  {
+    printf '%s\n' "$APT_HOSTS_BEGIN"
+    printf '%s\n' "${entries[@]}"
+    printf '%s\n' "$APT_HOSTS_END"
+  } >> "$APT_HOSTS_FILE"
+  msg_ok "apt-Hosts gepinnt (eingebauter Fallback): ${entries[*]}"
+}
+
+# Prüft, dass der Pin wirklich greift: getent muss den gepinnten Eintrag aus
+# /etc/hosts zurückgeben, nicht nur irgendeine DNS-Antwort.
+apt_hosts_verified() {
+  local ip
+  ip="$(getent ahostsv4 deb.debian.org 2>/dev/null | awk 'NR==1 {print $1}')"
+  [[ -n "$ip" ]] || return 1
+  grep -qxF "${ip} deb.debian.org" "$APT_HOSTS_FILE"
+}
 
 pin_apt_hosts() {
   APT_HOSTS_PINNED=0
-  [[ -f "$APT_HOSTS_PIN" ]] || return 0
-  if bash "$APT_HOSTS_PIN" pin; then
-    APT_HOSTS_PINNED=1
+  if [[ -f "$APT_HOSTS_PIN" ]]; then
+    if ! bash "$APT_HOSTS_PIN" pin; then
+      msg_warn "apt-hosts-pin.sh ist fehlgeschlagen - nutze eingebauten Fallback."
+      apt_hosts_pin_inline || true
+    fi
   else
-    msg_warn "Host-Pinning fehlgeschlagen - apt nutzt DNS."
+    msg_warn "apt-hosts-pin.sh fehlt (veraltetes Packaging?) - nutze eingebauten Fallback."
+    apt_hosts_pin_inline || true
   fi
+  if apt_hosts_verified; then
+    APT_HOSTS_PINNED=1
+    msg_ok "apt-Hosts verifiziert - apt braucht für die Installation kein DNS."
+  else
+    msg_warn "apt-Hosts konnten nicht verifiziert werden - apt nutzt DNS (anfällig)."
+  fi
+  (( APT_HOSTS_PINNED ))
 }
 
 unpin_apt_hosts() {
   APT_HOSTS_PINNED=0
-  [[ -f "$APT_HOSTS_PIN" ]] || return 0
-  bash "$APT_HOSTS_PIN" unpin >/dev/null 2>&1 || true
+  if [[ -f "$APT_HOSTS_PIN" ]]; then
+    bash "$APT_HOSTS_PIN" unpin >/dev/null 2>&1 || true
+  fi
+  # Immer zusätzlich inline aufräumen: So bleibt auch bei einer defekten
+  # oder veralteten apt-hosts-pin.sh kein Marker in /etc/hosts zurück.
+  apt_hosts_remove_block >/dev/null 2>&1 || true
 }
+# <<< tolaria-inline-pin <<<
 trap 'unpin_apt_hosts' EXIT
 
 # ---------------------------------------------------------------------------
@@ -215,7 +307,7 @@ trap 'unpin_apt_hosts' EXIT
 msg_info "Aktualisiere Paketlisten und installiere Systempakete ..."
 export DEBIAN_FRONTEND=noninteractive
 
-pin_apt_hosts
+pin_apt_hosts || msg_warn "Weiter ohne verifizierten Pin - apt nutzt DNS (anfällig)."
 
 # apt-get update kann mit Exit 0 enden, obwohl ALLE Indexe nicht geladen
 # wurden ("W: Failed to fetch ... Some index files failed to download").
@@ -228,12 +320,32 @@ apt_log_has_fetch_errors() {
   [[ -s "$APT_LOG" ]] && grep -qE 'Failed to fetch|Temporary failure resolving|Could not resolve' "$APT_LOG"
 }
 
+# Eine Stelle für alle apt-Diagnosen, damit Fehlerberichte vergleichbar sind.
+# Proxy-Werte werden bewusst nicht ausgegeben (können Zugangsdaten enthalten).
+apt_diag() {
+  msg_error "--- apt-Diagnose ---"
+  msg_error "Nameserver: ${TOLARIA_DNS_SERVERS}"
+  msg_error "IPv4/A: $(getent ahostsv4 deb.debian.org 2>&1 | awk 'NR<=2 {print $1}' | paste -sd' ' - || true)"
+  msg_error "IPv6/AAAA: $(getent ahostsv6 deb.debian.org 2>&1 | awk 'NR<=2 {print $1}' | paste -sd' ' - || true)"
+  msg_error "Pin aktiv: ${APT_HOSTS_PINNED}"
+  if [[ -f "$APT_HOSTS_FILE" ]] && grep -qF "$APT_HOSTS_BEGIN" "$APT_HOSTS_FILE"; then
+    msg_error "--- /etc/hosts (Pin-Block) ---"
+    grep -A6 -F "$APT_HOSTS_BEGIN" "$APT_HOSTS_FILE" 2>/dev/null || true
+  fi
+  msg_error "--- apt-Proxy (nur gesetzte Schlüssel) ---"
+  apt-config dump 2>/dev/null | awk '/Proxy/ {print "  " $1 " <gesetzt>"}' || true
+  msg_error "--- /etc/resolv.conf ---"
+  cat /etc/resolv.conf 2>/dev/null || true
+  msg_error "--- letzte ${APT_LOG##*/}-Zeilen ---"
+  tail -n 40 "$APT_LOG" 2>/dev/null || true
+}
+
 update_ok=0
 if retry 3 5 apt_update_once; then
   update_ok=1
 fi
 if (( update_ok == 0 )) && (( APT_HOSTS_PINNED )); then
-  msg_warn "apt-get update mit vorab aufgelösten Hosts fehlgeschlagen - versuche ohne Pin ..."
+  msg_warn "apt-get update mit verifiziertem Host-Pinning fehlgeschlagen - teste DNS als Gegenprobe ..."
   unpin_apt_hosts
   if retry 2 5 apt_update_once; then
     update_ok=1
@@ -241,12 +353,9 @@ if (( update_ok == 0 )) && (( APT_HOSTS_PINNED )); then
 fi
 
 if (( update_ok == 0 )); then
-  cat "$APT_LOG" 2>/dev/null || true
+  apt_diag
   msg_error "apt-get update ist fehlgeschlagen (DNS, Proxy oder Mirror-Problem)."
-  msg_error "Nameserver: ${TOLARIA_DNS_SERVERS}"
-  msg_error "IPv4/A: $(getent ahostsv4 deb.debian.org 2>&1 | awk 'NR<=2 {print $1}' | paste -sd' ' - || true)"
-  msg_error "IPv6/AAAA: $(getent ahostsv6 deb.debian.org 2>&1 | awk 'NR<=2 {print $1}' | paste -sd' ' - || true)"
-  cat /etc/resolv.conf 2>/dev/null || true
+  msg_error "Ein oben sichtbarer Pin-Block schließt DNS als Hauptursache weitgehend aus."
   exit 1
 fi
 
@@ -255,7 +364,7 @@ if apt_log_has_fetch_errors; then
   if apt-get install -y --simulate --no-install-recommends "${APT_OPTS[@]}" "${APT_PACKAGES[@]}" >/dev/null 2>&1; then
     msg_warn "Paketauflösung funktioniert trotz Fetch-Warnungen - fahre fort."
   else
-    cat "$APT_LOG"
+    apt_diag
     msg_error "Paketlisten unvollständig und Pakete nicht auflösbar."
     msg_error "Prüfe DNS/Proxy/Internet im Container und führe den Installer erneut aus."
     exit 1
@@ -271,28 +380,43 @@ apt_install_packages() {
 if ! getent ahostsv4 deb.debian.org >/dev/null 2>&1; then
   msg_warn "IPv4-Auflösung vor dem Paketdownload gestört - repariere erneut ..."
   if ! dns_guard; then
+    apt_diag
     msg_error "DNS-Reparatur vor dem Paketdownload fehlgeschlagen."
-    cat /etc/resolv.conf 2>/dev/null || true
     exit 1
   fi
 fi
 
-if ! retry 3 10 apt_install_packages; then
-  msg_warn "Erster Installationsversuch fehlgeschlagen - aktualisiere Listen und versuche es mit --fix-missing erneut ..."
-  if (( APT_HOSTS_PINNED )); then
-    msg_warn "Entferne Host-Pinning und versuche die Auflösung wieder über DNS ..."
-    unpin_apt_hosts
+install_ok=0
+if retry 3 10 apt_install_packages; then
+  install_ok=1
+fi
+if (( install_ok == 0 )); then
+  msg_warn "Erster Installationsversuch fehlgeschlagen - aktualisiere Listen und versuche es erneut ..."
+  # Pin nicht vorschnell entfernen: Wenn er verifiziert ist, ist DNS nicht die
+  # Ursache. Erst mit Pin neu laden und erneut installieren.
+  retry 2 10 apt_update_once || msg_warn "apt-get update beim zweiten Versuch fehlgeschlagen."
+  if retry 3 10 apt_install_packages; then
+    install_ok=1
   fi
-  retry 2 10 apt-get update "${APT_OPTS[@]}" >>"$APT_LOG" 2>&1 || msg_warn "apt-get update beim zweiten Versuch fehlgeschlagen."
-  if ! apt-get install -y --no-install-recommends --fix-missing "${APT_OPTS[@]}" "${APT_PACKAGES[@]}"; then
-    msg_error "Systempakete konnten nicht installiert werden."
-    msg_error "Nameserver: ${TOLARIA_DNS_SERVERS}"
-    msg_error "IPv4/A: $(getent ahostsv4 deb.debian.org 2>&1 | awk 'NR<=2 {print $1}' | paste -sd' ' - || true)"
-    msg_error "IPv6/AAAA: $(getent ahostsv6 deb.debian.org 2>&1 | awk 'NR<=2 {print $1}' | paste -sd' ' - || true)"
-    cat /etc/resolv.conf 2>/dev/null || true
-    msg_error "Häufigste Ursache: DNS/Internet/Proxy im Container (siehe ${APT_LOG})."
-    exit 1
+fi
+
+# Letzter Ausweg: Der gepinnte Mirror-IP-Block kann selbst unerreichbar sein
+# (z. B. blockiertes Fastly-Subnetz). Dann zurück auf DNS.
+if (( install_ok == 0 )) && (( APT_HOSTS_PINNED )); then
+  msg_warn "Mit gepinnten Hosts weiterhin Fehler - letzter Versuch über DNS ..."
+  unpin_apt_hosts
+  retry 2 10 apt_update_once || msg_warn "apt-get update über DNS fehlgeschlagen."
+  if apt-get install -y --no-install-recommends --fix-missing "${APT_OPTS[@]}" "${APT_PACKAGES[@]}"; then
+    install_ok=1
   fi
+fi
+
+if (( install_ok == 0 )); then
+  apt_diag
+  msg_error "Systempakete konnten nicht installiert werden."
+  msg_error "Häufigste Ursachen: DNS/Internet/Proxy im Container, blockierter Mirror"
+  msg_error "oder ein veraltetes Paket-Index. Details siehe ${APT_LOG}."
+  exit 1
 fi
 unpin_apt_hosts
 msg_ok "Systempakete installiert."
@@ -325,7 +449,7 @@ fi
 
 if [[ "$need_node" == "1" ]]; then
   msg_info "Installiere Node.js 22.x von NodeSource ..."
-  pin_apt_hosts
+  pin_apt_hosts || msg_warn "NodeSource-Pin nicht verifiziert - nutze DNS."
   if ! retry 3 5 curl -fsSL --max-time 60 https://deb.nodesource.com/setup_22.x -o /tmp/nodesource_setup.sh; then
     msg_error "NodeSource-Setup konnte nicht geladen werden (https://deb.nodesource.com)."
     msg_error "Prüfe DNS/Internet/Proxy im Container."

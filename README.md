@@ -11,14 +11,19 @@ Ein Community-Scripts-artiger Einzeiler, der **Tolaria** (lokale Markdown-Wissen
 Auf dem **Proxmox-Host** als root:
 
 ```bash
-bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/TolariaNotizen/main/install/tolaria.sh)"
+wget -qO /tmp/tolaria.sh \
+  "https://raw.githubusercontent.com/HatchetMan111/TolariaNotizen/main/install/tolaria.sh?cb=$(date +%s)" \
+  && bash /tmp/tolaria.sh
 ```
+
+Der `?cb=`-Parameter ist kein Zierrat: `raw.githubusercontent.com` liegt hinter einem CDN und kann `main` einige Minuten lang veraltet ausliefern. Ohne Cache-Buster kann ein frisch gepushter Fix noch nicht im ausgeführten Skript stehen. Das Herunterladen in eine Datei hat außerdem den Vorteil, dass ein fehlgeschlagener Download nicht als leeres `bash -c ""` mit Exit-Code 0 endet.
 
 Alternativ mit festen Ressourcen / CT-ID:
 
 ```bash
-CT_ID=150 CORES=4 RAM=6144 DISK=12 \
-  bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/TolariaNotizen/main/install/tolaria.sh)"
+wget -qO /tmp/tolaria.sh \
+  "https://raw.githubusercontent.com/HatchetMan111/TolariaNotizen/main/install/tolaria.sh?cb=$(date +%s)"
+CT_ID=150 CORES=4 RAM=6144 DISK=12 bash /tmp/tolaria.sh
 ```
 
 Oder lokal:
@@ -116,6 +121,16 @@ Basic Auth auf `/v1/*` wäre technisch falsch: Der Client überschreibt den `Aut
 
 Umgebungsvariablen funktionieren ebenfalls, z. B. `CT_ID`, `CORES`, `RAM`, `SWAP`, `DISK`, `BRIDGE`, `PORT`, `TOLARIA_REF`, `DNS_SERVERS`, `FORCE_BUILD`.
 
+Für Packaging-Downloads gibt es zusätzlich:
+
+| Variable | Zweck |
+|---|---|
+| `TOLARIA_PACKAGING_REF` | Branch/Tag/Commit des Installer-Repos für den Tarball (Default: `main`) |
+| `TOLARIA_PACKAGING_TARBALL` | Eigene Tarball-URL oder lokaler Pfad statt `codeload.github.com` |
+| `TOLARIA_PACKAGING_DIR` | Lokaler Checkout; umgeht den Download komplett (für Entwicklung/Offline) |
+| `TOLARIA_REPO_SLUG` | GitHub-Repo für den Tarball, falls Fork (Default: `HatchetMan111/TolariaNotizen`) |
+| `TOLARIA_RAW_BASE` | Basis-URL für den Raw-Datei-Fallback |
+
 `--auth-password` erlaubt nur `A-Z a-z 0-9 . _ ~ @ % + = : , / -`. Ohne Angabe wird ein zufälliges Hex-Passwort erzeugt. `--debug` pausiert den Trace bewusst vor der Secret-Erzeugung, damit Token/Passwörter nicht im Install-Log landen.
 
 ## Update
@@ -123,7 +138,9 @@ Umgebungsvariablen funktionieren ebenfalls, z. B. `CT_ID`, `CORES`, `RAM`, `SWAP
 Einfach den Einzeiler erneut ausführen. Der bestehende Container wird erkannt und wiederverwendet:
 
 ```bash
-bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/TolariaNotizen/main/install/tolaria.sh)"
+wget -qO /tmp/tolaria.sh \
+  "https://raw.githubusercontent.com/HatchetMan111/TolariaNotizen/main/install/tolaria.sh?cb=$(date +%s)" \
+  && bash /tmp/tolaria.sh
 ```
 
 Ablauf beim Update:
@@ -137,7 +154,9 @@ Ablauf beim Update:
 Ein Rebuild lässt sich jederzeit erzwingen:
 
 ```bash
-FORCE_BUILD=1 bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/TolariaNotizen/main/install/tolaria.sh)"
+wget -qO /tmp/tolaria.sh \
+  "https://raw.githubusercontent.com/HatchetMan111/TolariaNotizen/main/install/tolaria.sh?cb=$(date +%s)"
+FORCE_BUILD=1 bash /tmp/tolaria.sh
 ```
 
 Für einen bestimmten Stand: `--ref <tag-oder-branch>`.
@@ -178,6 +197,26 @@ Vorher Backup erstellen. `pct destroy` löscht den Vault unwiderruflich.
 
 ## Troubleshooting
 
+### Der Installer verhält sich wie eine alte Version
+
+Symptom: Ein Fix ist auf `main`, aber der Lauf zeigt weiterhin das alte Verhalten – zum Beispiel fehlt die Meldung zum apt-Host-Pinning, oder `setup-in-container.sh` scheitert an einer Datei, die es in `main` längst gibt.
+
+Ursache ist der GitHub-CDN: `raw.githubusercontent.com` cached `main` typischerweise einige Minuten. Das Installer-Skript und die einzeln nachgeladenen Packaging-Dateien können dadurch aus **unterschiedlichen Commits** stammen. Der Installer lädt Packaging deshalb inzwischen bevorzugt als **einen Tarball** (`codeload.github.com/.../tar.gz/refs/heads/main`), also als konsistenten Snapshot. Zusätzlich ist das apt-Host-Pinning im Container-Skript selbst eingebaut, falls `apt-hosts-pin.sh` durch ein altes Host-Skript nicht mitgepusht wurde.
+
+Trotzdem gilt: Nach einem Push den Einzeiler mit Cache-Buster verwenden:
+
+```bash
+wget -qO /tmp/tolaria.sh \
+  "https://raw.githubusercontent.com/HatchetMan111/TolariaNotizen/main/install/tolaria.sh?cb=$(date +%s)" \
+  && bash /tmp/tolaria.sh
+```
+
+Für einen reproduzierbaren Stand kann Packaging explizit gepinnt werden:
+
+```bash
+TOLARIA_PACKAGING_REF=<commit-oder-tag> bash /tmp/tolaria.sh
+```
+
 ### `Temporary failure resolving 'deb.debian.org'` / apt Exit-Code 100
 
 Das ist der häufigste Installationsfehler in Proxmox-LXCs. Zwei Ursachen treten dabei auf:
@@ -203,13 +242,18 @@ Wichtig ist `getent ahostsv4` (nicht `getent hosts`): Nur so sieht man, ob apt d
 
 ### DNS funktioniert, apt meldet aber weiter `Temporary failure resolving`
 
-Wenn `getent ahostsv4 deb.debian.org` eine Adresse liefert, apt beim Download aber trotzdem an der Auflösung scheitert, bricht die Namensauflösung unter der Last vieler paralleler apt-Verbindungen zusammen (typisch bei NAT/Conntrack oder Rate-Limits im Router). Der Installer löst deshalb `deb.debian.org`, `security.debian.org` und `deb.nodesource.com` vor der Paketinstallation einmal auf, pinnt sie kurzzeitig in `/etc/hosts` (markierter Block `tolaria-apt-hosts`) und entfernt den Block danach wieder. Damit braucht apt während der Installation gar kein DNS.
+Wenn `getent ahostsv4 deb.debian.org` eine Adresse liefert, apt beim Download aber trotzdem an der Auflösung scheitert, bricht die Namensauflösung unter der Last vieler paralleler apt-Verbindungen zusammen (typisch bei NAT/Conntrack oder Rate-Limits im Router). Der Installer löst deshalb `deb.debian.org`, `security.debian.org` und `deb.nodesource.com` vor der Paketinstallation einmal auf, pinnt sie kurzzeitig in `/etc/hosts` (markierter Block `tolaria-apt-hosts`) und entfernt den Block danach wieder. Damit braucht apt während der Installation gar kein DNS. Pro Host werden bis zu zwei A-Records gepinnt; nach dem Schreiben prüft der Installer, ob `getent` wirklich den gepinnten Eintrag liefert.
+
+Das Pinning steckt sowohl in `scripts/apt-hosts-pin.sh` als auch als eingebauter Fallback direkt in `setup-in-container.sh`. Damit scheitert es nicht daran, dass ein veraltetes Host-Skript die separate Datei nicht in den Container kopiert hat.
+
+Schlägt apt trotz aktiven Pins fehl, bleibt der Pin zunächst aktiv und der Installer versucht es mit frischen Listen erneut. Erst wenn das ebenfalls scheitert, entfernt er den Pin für einen letzten DNS-Versuch. Die Diagnose (Pin-Block, A/AAAA, Proxy-Schlüssel, letzte apt-Zeilen) landet im Build-Log; die apt-Rohausgabe steht in `/root/tolaria-apt-update.log`.
 
 Manuell prüfen:
 
 ```bash
 pct exec 109 -- getent ahostsv4 deb.debian.org   # liefert eine IP?
-pct exec 109 -- grep -A4 tolaria-apt-hosts /etc/hosts
+pct exec 109 -- grep -A6 tolaria-apt-hosts /etc/hosts
+pct exec 109 -- tail -n 40 /root/tolaria-apt-update.log
 ```
 
 Der Block darf nach dem Lauf nicht mehr vorhanden sein; falls doch (z. B. nach einem Abbruch), entfernt ihn der nächste Lauf automatisch.
@@ -217,7 +261,9 @@ Der Block darf nach dem Lauf nicht mehr vorhanden sein; falls doch (z. B. nach e
 Danach den Installer erneut ausführen. In einem LAN ohne öffentlichen DNS die dort gültigen Resolver verwenden:
 
 ```bash
-DNS_SERVERS="192.168.1.1" bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/TolariaNotizen/main/install/tolaria.sh)"
+wget -qO /tmp/tolaria.sh \
+  "https://raw.githubusercontent.com/HatchetMan111/TolariaNotizen/main/install/tolaria.sh?cb=$(date +%s)"
+DNS_SERVERS="192.168.1.1" bash /tmp/tolaria.sh
 ```
 
 `pct set --nameserver` ist wichtig: Ohne den Eintrag in der CT-Config schreibt Proxmox die kaputte Datei beim nächsten Start wieder. Der Installer ist idempotent: Bei einem vorhandenen Container genügt ein erneuter Lauf, er repariert DNS und den DHCP-Schutz automatisch.
@@ -323,8 +369,11 @@ In dieser Umgebung wurde **kein echter Proxmox-Host** ausgeführt. Validiert wur
 - systemd-Unit (soweit ohne `tolaria`-User/Pfade auf dem Testhost möglich)
 - Installer `--dry-run`, `--help` und Secret-Redaction
 - DNS-Reparatur (`scripts/repair-dns.sh`): Rendering der `resolv.conf`, Validierung von Nameservern, Ablehnung ungültiger Eingaben, Fallback-Nameserver, Backup/Restore, IPv4/A-Record-Prüfung und idempotentes Festschreiben gegen DHCP (`supersede`)
-- apt-Host-Pinning (`scripts/apt-hosts-pin.sh`): Auflösen, markierter `/etc/hosts`-Block, Idempotenz und restloses Entfernen (funktional getestet)
-- Persistenz der tatsächlich funktionierenden Nameserver in der CT-Config (statisch geprüft)
+- apt-Host-Pinning (`scripts/apt-hosts-pin.sh`): Auflösen, markierter `/etc/hosts`-Block, Idempotenz und restloses Entfernen (funktional getestet); mehrere A-Records pro Host, Zeilenumbruch-sichere Marker und Hostnamen-Validierung
+- Eingebauter Pinning-Fallback in `setup-in-container.sh` (funktional getestet), damit ein veraltetes Host-Skript das Pinning nicht aushebeln kann
+- Verifikation des Pins über `getent ahostsv4` plus `/etc/hosts`-Abgleich; apt versucht bei Fehlern zuerst erneut mit Pin und entfernt ihn erst für den letzten DNS-Versuch
+- Packaging als atomarer Tarball inkl. Cache-Buster und Raw-Fallback: lokaler Tarball, `file://`-Tarball und echter `codeload.github.com`-Download getestet
+- Persistenz der tatsächlich funktionierenden Nameserver in der CT-Config (statisch geprüft); wird jetzt auch bei bereits funktionierendem DNS geschrieben
 - Statische Prüfung, dass apt-Fehler nicht mehr ignoriert werden (`Failed to fetch`-Erkennung, Retries)
 - Statische Prüfung des inkrementellen Updates (`FORCE_BUILD`, Build-Skip)
 - `tests/static-checks.sh` (alle Checks bestanden)

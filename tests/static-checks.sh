@@ -191,6 +191,142 @@ if bash "$REPO_ROOT/scripts/apt-hosts-pin.sh" bogus >/dev/null 2>&1; then
 else
   pass "ungültige Aktion wird abgelehnt"
 fi
+if bash "$REPO_ROOT/scripts/apt-hosts-pin.sh" pin \
+     --hosts-file "$HOSTS_FILE" --hosts 'bad;host' --retries 1 >/dev/null 2>&1; then
+  fail "ungültiger Hostname wird abgelehnt"
+else
+  pass "ungültiger Hostname wird abgelehnt"
+fi
+
+# /etc/hosts endet nicht immer mit Zeilenumbruch. Der Marker muss trotzdem
+# als eigene Zeile erkannt und wieder entfernt werden können.
+printf '127.0.0.1 localhost' > "$HOSTS_FILE"
+if env PATH="$PIN_BIN:$PATH" bash "$REPO_ROOT/scripts/apt-hosts-pin.sh" pin \
+     --hosts-file "$HOSTS_FILE" --hosts "deb.debian.org" --retries 1 >/dev/null 2>&1 \
+   && grep -qx '151.101.1.1 deb.debian.org' "$HOSTS_FILE" \
+   && bash "$REPO_ROOT/scripts/apt-hosts-pin.sh" unpin --hosts-file "$HOSTS_FILE" >/dev/null 2>&1 \
+   && grep -qx '127.0.0.1 localhost' "$HOSTS_FILE" \
+   && ! grep -q 'tolaria-apt-hosts' "$HOSTS_FILE"; then
+  pass "Pin funktioniert ohne abschließenden Zeilenumbruch"
+else
+  fail "Pin funktioniert ohne abschließenden Zeilenumbruch"
+fi
+
+# Zwei A-Records pro Host erhöhen die Chance, dass ein blockiertes
+# Fastly-Subnetz nicht die ganze Installation verhindert.
+PIN_BIN2="$TMP_DIR/pinbin2"
+mkdir -p "$PIN_BIN2"
+cat > "$PIN_BIN2/getent" <<'EOF'
+#!/usr/bin/env sh
+printf '151.101.1.1\n151.101.2.2\n'
+EOF
+chmod +x "$PIN_BIN2/getent"
+printf '127.0.0.1 localhost\n' > "$HOSTS_FILE"
+if env PATH="$PIN_BIN2:$PATH" bash "$REPO_ROOT/scripts/apt-hosts-pin.sh" pin \
+     --hosts-file "$HOSTS_FILE" --hosts "deb.debian.org" --retries 1 >/dev/null 2>&1 \
+   && grep -qx '151.101.1.1 deb.debian.org' "$HOSTS_FILE" \
+   && grep -qx '151.101.2.2 deb.debian.org' "$HOSTS_FILE"; then
+  pass "mehrere A-Records werden gepinnt"
+else
+  fail "mehrere A-Records werden gepinnt"
+fi
+bash "$REPO_ROOT/scripts/apt-hosts-pin.sh" unpin --hosts-file "$HOSTS_FILE" >/dev/null 2>&1 || true
+
+# Der eingebaute Fallback in setup-in-container.sh ist die Versicherung gegen
+# ein veraltetes Host-Skript, das apt-hosts-pin.sh nicht mitpusht. Deshalb
+# wird genau dieser Code hier funktional getestet (aus dem Skript extrahiert).
+SETUP_FILE="$REPO_ROOT/scripts/setup-in-container.sh"
+SETUP_PIN_HARNESS="$TMP_DIR/setup-pin-harness.sh"
+{
+  echo '#!/usr/bin/env bash'
+  echo 'set -euo pipefail'
+  echo 'msg_info() { echo "[INFO] $*"; }'
+  echo 'msg_ok() { echo "[OK] $*"; }'
+  echo 'msg_warn() { echo "[WARN] $*"; }'
+  echo 'msg_error() { echo "[ERROR] $*" >&2; }'
+  echo 'PKG_DIR="$1"'
+  sed -n '/^# >>> tolaria-inline-pin >>>/,/^# <<< tolaria-inline-pin <<</p' "$SETUP_FILE" | sed '1d;$d'
+  cat <<'EOF'
+apt_hosts_pin_inline
+apt_hosts_verified
+grep -q '^151.101.1.1 deb.debian.org$' "$APT_HOSTS_FILE"
+grep -q '^151.101.2.2 deb.debian.org$' "$APT_HOSTS_FILE"
+grep -q '^151.101.1.1 security.debian.org$' "$APT_HOSTS_FILE"
+apt_hosts_remove_block
+! grep -q 'tolaria-apt-hosts' "$APT_HOSTS_FILE"
+grep -qx '127.0.0.1 localhost' "$APT_HOSTS_FILE"
+EOF
+} > "$SETUP_PIN_HARNESS"
+INLINE_HOSTS="$TMP_DIR/inline-hosts"
+printf '127.0.0.1 localhost\n' > "$INLINE_HOSTS"
+if env PATH="$PIN_BIN2:$PATH" APT_HOSTS_FILE="$INLINE_HOSTS" \
+     bash "$SETUP_PIN_HARNESS" "$TMP_DIR/no-pin-script" >/dev/null 2>&1; then
+  pass "Setup: eingebauter Pin-Fallback funktioniert ohne apt-hosts-pin.sh"
+else
+  fail "Setup: eingebauter Pin-Fallback funktioniert ohne apt-hosts-pin.sh"
+fi
+
+echo ""
+echo "== Packaging-Tarball =="
+# Der Host-Installer lädt Packaging als einen konsistenten Tarball. Hier
+# wird die Funktion mit einem lokalen Snapshot getestet, damit der Test
+# ohne GitHub/Netzwerk läuft.
+PKG_SNAP="$TMP_DIR/pkg-snapshot"
+mkdir -p "$PKG_SNAP/scripts" "$PKG_SNAP/systemd" "$PKG_SNAP/nginx"
+cp "$REPO_ROOT/scripts/setup-in-container.sh" "$PKG_SNAP/scripts/"
+cp "$REPO_ROOT/scripts/inject-web-config.py" "$PKG_SNAP/scripts/"
+cp "$REPO_ROOT/scripts/seed-vault.sh" "$PKG_SNAP/scripts/"
+cp "$REPO_ROOT/scripts/repair-dns.sh" "$PKG_SNAP/scripts/"
+cp "$REPO_ROOT/scripts/apt-hosts-pin.sh" "$PKG_SNAP/scripts/"
+cp "$REPO_ROOT/systemd/tolaria.service" "$PKG_SNAP/systemd/"
+cp "$REPO_ROOT/nginx/tolaria.conf" "$PKG_SNAP/nginx/"
+PKG_TARBALL="$TMP_DIR/packaging.tar.gz"
+tar -czf "$PKG_TARBALL" -C "$PKG_SNAP" .
+
+PKG_FETCH_HARNESS="$TMP_DIR/pkg-fetch-harness.sh"
+{
+  echo '#!/usr/bin/env bash'
+  echo 'set -euo pipefail'
+  echo 'msg_info() { echo "[INFO] $*"; }'
+  echo 'msg_ok() { echo "[OK] $*"; }'
+  echo 'msg_warn() { echo "[WARN] $*"; }'
+  echo 'msg_error() { echo "[ERROR] $*" >&2; }'
+  sed -n '/^# >>> tolaria-packaging-fetch >>>/,/^# <<< tolaria-packaging-fetch <<</p' "$REPO_ROOT/install/tolaria.sh" | sed '1d;$d'
+  cat <<'EOF'
+PKG_DIR="$1"
+PACKAGING_TARBALL="$2"
+PACKAGING_REF=main
+INSTALLER_REPO_SLUG=HatchetMan111/TolariaNotizen
+INSTALLER_RAW="https://raw.githubusercontent.com/HatchetMan111/TolariaNotizen/main"
+PACKAGING_SOURCE=""
+PACKAGING_FILES=(
+  "scripts/setup-in-container.sh"
+  "scripts/inject-web-config.py"
+  "scripts/seed-vault.sh"
+  "scripts/repair-dns.sh"
+  "scripts/apt-hosts-pin.sh"
+  "systemd/tolaria.service"
+  "nginx/tolaria.conf"
+)
+mkdir -p "$PKG_DIR"
+fetch_packaging_tarball
+for rel in "${PACKAGING_FILES[@]}"; do
+  [[ -s "$PKG_DIR/$(basename "$rel")" ]] || exit 1
+done
+EOF
+} > "$PKG_FETCH_HARNESS"
+if bash "$PKG_FETCH_HARNESS" "$TMP_DIR/pkg-target" "$PKG_TARBALL" >/dev/null 2>&1 \
+   && [[ -s "$TMP_DIR/pkg-target/setup-in-container.sh" ]] \
+   && [[ -s "$TMP_DIR/pkg-target/tolaria.conf" ]]; then
+  pass "Packaging-Tarball wird entpackt und alle Dateien sind vorhanden"
+else
+  fail "Packaging-Tarball wird entpackt und alle Dateien sind vorhanden"
+fi
+if bash "$PKG_FETCH_HARNESS" "$TMP_DIR/pkg-target-bad" "$TMP_DIR/does-not-exist.tar.gz" >/dev/null 2>&1; then
+  fail "defekter Packaging-Tarball wird abgelehnt"
+else
+  pass "defekter Packaging-Tarball wird abgelehnt"
+fi
 if bash "$REPO_ROOT/scripts/repair-dns.sh" --servers "8.8.8.8 && echo pwned" \
      --resolv-conf "$DNS_CONF" --skip-check >/dev/null 2>&1; then
   fail "ungültiger Nameserver wird abgelehnt"
@@ -358,8 +494,19 @@ run "Host: persistiert effektive CT-Nameserver" grep -Fq 'CT_DNS_EFFECTIVE' "$HO
 run "Host: liest Nameserver aus CT-resolv.conf" grep -Fq "awk '/^nameserver" "$HOST_INST"
 run "Host: repair-dns.sh wird in den CT gepusht" grep -q 'repair-dns.sh' "$HOST_INST"
 run "Host: apt-hosts-pin.sh im Packaging" grep -q 'scripts/apt-hosts-pin.sh' "$HOST_INST"
+run "Host: Packaging als atomarer Tarball" grep -q 'codeload.github.com' "$HOST_INST"
+run "Host: Cache-Buster fuer Downloads" grep -q 'cache_busted_url' "$HOST_INST"
+run "Host: Raw-Download als Fallback" grep -q 'fetch_packaging_raw' "$HOST_INST"
+run "Host: Tarball-Download" grep -q 'fetch_packaging_tarball' "$HOST_INST"
+run "Host: Packaging-Ref konfigurierbar" grep -q 'TOLARIA_PACKAGING_REF' "$HOST_INST"
 run "Setup: apt-Hosts werden gepinnt" grep -q 'apt-hosts-pin.sh' "$CT_SETUP"
 run "Setup: Pinning wird entfernt" grep -qF '"$APT_HOSTS_PIN" unpin' "$CT_SETUP"
+run "Setup: eingebauter Pin-Fallback" grep -q 'apt_hosts_pin_inline' "$CT_SETUP"
+run "Setup: Pin wird verifiziert" grep -q 'apt_hosts_verified' "$CT_SETUP"
+run "Setup: Pin-Fehler bricht Setup nicht ab" grep -q 'pin_apt_hosts || msg_warn' "$CT_SETUP"
+run "Setup: mehrere A-Records pro Host" grep -q 'head -n2' "$CT_SETUP"
+run "Setup: apt-Diagnose vorhanden" grep -q 'apt_diag' "$CT_SETUP"
+run "Setup: dpkg-Lock-Timeout" grep -q 'DPkg::Lock::Timeout' "$CT_SETUP"
 run "Host: Nameserver beim pct create" grep -q -- '--nameserver "\$CT_DNS"' "$HOST_INST"
 run "Setup: DNS-Guard vor apt" grep -q 'REPAIR_DNS.*--servers' "$CT_SETUP"
 run "Setup: DNS-Guard persistiert dhclient" grep -q -- '--persist-dhclient' "$CT_SETUP"
@@ -377,6 +524,8 @@ fi
 run "Setup: Build-Skip bei unverändertem Commit" grep -q 'NEED_BUILD' "$CT_SETUP"
 run "Setup: FORCE_BUILD" grep -q 'FORCE_BUILD' "$CT_SETUP"
 run "README: Troubleshooting DNS" grep -q "Temporary failure resolving" "$REPO_ROOT/README.md"
+run "README: Troubleshooting CDN-Cache" grep -q 'GitHub-CDN' "$REPO_ROOT/README.md"
+run "README: Einzeiler mit Cache-Buster" grep -q 'cb=$(date +%s)' "$REPO_ROOT/README.md"
 
 echo ""
 echo "== Installer-Dry-Run / Hilfe =="
