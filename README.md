@@ -201,6 +201,19 @@ pct exec "$CTID" -- getent ahostsv4 deb.debian.org
 
 Wichtig ist `getent ahostsv4` (nicht `getent hosts`): Nur so sieht man, ob apt die benötigten A-Records bekommt.
 
+### DNS funktioniert, apt meldet aber weiter `Temporary failure resolving`
+
+Wenn `getent ahostsv4 deb.debian.org` eine Adresse liefert, apt beim Download aber trotzdem an der Auflösung scheitert, bricht die Namensauflösung unter der Last vieler paralleler apt-Verbindungen zusammen (typisch bei NAT/Conntrack oder Rate-Limits im Router). Der Installer löst deshalb `deb.debian.org`, `security.debian.org` und `deb.nodesource.com` vor der Paketinstallation einmal auf, pinnt sie kurzzeitig in `/etc/hosts` (markierter Block `tolaria-apt-hosts`) und entfernt den Block danach wieder. Damit braucht apt während der Installation gar kein DNS.
+
+Manuell prüfen:
+
+```bash
+pct exec 109 -- getent ahostsv4 deb.debian.org   # liefert eine IP?
+pct exec 109 -- grep -A4 tolaria-apt-hosts /etc/hosts
+```
+
+Der Block darf nach dem Lauf nicht mehr vorhanden sein; falls doch (z. B. nach einem Abbruch), entfernt ihn der nächste Lauf automatisch.
+
 Danach den Installer erneut ausführen. In einem LAN ohne öffentlichen DNS die dort gültigen Resolver verwenden:
 
 ```bash
@@ -288,6 +301,7 @@ Der Test prüft `onboot=1`, `systemctl is-enabled`, rebootet den **Container**, 
 install/tolaria.sh              Host-Installer (Proxmox)
 scripts/setup-in-container.sh   Build/Setup im LXC
 scripts/repair-dns.sh           DNS-Check/-Reparatur im Container
+scripts/apt-hosts-pin.sh        apt-Hosts temporär in /etc/hosts pinnen
 scripts/inject-web-config.py    idempotente HTML-Injection
 scripts/seed-vault.sh           bare Git-Vault seeden
 systemd/tolaria.service         systemd-Unit
@@ -309,6 +323,7 @@ In dieser Umgebung wurde **kein echter Proxmox-Host** ausgeführt. Validiert wur
 - systemd-Unit (soweit ohne `tolaria`-User/Pfade auf dem Testhost möglich)
 - Installer `--dry-run`, `--help` und Secret-Redaction
 - DNS-Reparatur (`scripts/repair-dns.sh`): Rendering der `resolv.conf`, Validierung von Nameservern, Ablehnung ungültiger Eingaben, Fallback-Nameserver, Backup/Restore, IPv4/A-Record-Prüfung und idempotentes Festschreiben gegen DHCP (`supersede`)
+- apt-Host-Pinning (`scripts/apt-hosts-pin.sh`): Auflösen, markierter `/etc/hosts`-Block, Idempotenz und restloses Entfernen (funktional getestet)
 - Persistenz der tatsächlich funktionierenden Nameserver in der CT-Config (statisch geprüft)
 - Statische Prüfung, dass apt-Fehler nicht mehr ignoriert werden (`Failed to fetch`-Erkennung, Retries)
 - Statische Prüfung des inkrementellen Updates (`FORCE_BUILD`, Build-Skip)

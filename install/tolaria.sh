@@ -449,6 +449,7 @@ PACKAGING_FILES=(
   "scripts/inject-web-config.py"
   "scripts/seed-vault.sh"
   "scripts/repair-dns.sh"
+  "scripts/apt-hosts-pin.sh"
   "systemd/tolaria.service"
   "nginx/tolaria.conf"
 )
@@ -694,7 +695,7 @@ for rel in "${PACKAGING_FILES[@]}"; do
   base="$(basename "$rel")"
   pct push "$CTID" "$PKG_DIR/$base" "/root/tolaria-packaging/$base"
 done
-pct exec "$CTID" -- chmod 755 /root/tolaria-packaging/repair-dns.sh
+pct exec "$CTID" -- chmod 755 /root/tolaria-packaging/repair-dns.sh /root/tolaria-packaging/apt-hosts-pin.sh
 pct exec "$CTID" -- chmod 700 /root/tolaria-packaging/setup-in-container.sh /root/tolaria-packaging/seed-vault.sh
 pct push "$CTID" "$INSTALL_ENV" "/root/tolaria-packaging/install.env"
 pct exec "$CTID" -- chmod 600 /root/tolaria-packaging/install.env

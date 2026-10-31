@@ -210,7 +210,13 @@ write_resolv() {
   } > "$tmp"
 
   chmod 644 "$tmp"
-  if ! mv -f "$tmp" "$RESOLV_CONF"; then
+  if ! mv -f "$tmp" "$RESOLV_CONF" 2>/dev/null; then
+    # Bind-Mount (in manchen LXC-Setups): mv scheitert mit EBUSY, dann in-place.
+    if cat "$tmp" > "$RESOLV_CONF" 2>/dev/null; then
+      rm -f "$tmp"
+      msg_info "Nameserver geschrieben: ${servers} (${RESOLV_CONF}, in-place)"
+      return 0
+    fi
     rm -f "$tmp"
     msg_error "Konnte ${RESOLV_CONF} nicht ersetzen (evtl. bind-gemountet?)."
     return 1

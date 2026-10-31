@@ -152,6 +152,45 @@ if PATH="$FAKE_BIN:$PATH" WATCH="$FALLBACK_CONF" BADPAT='198\.51\.100\.|203\.0\.
 else
   fail "Fallback-Nameserver werden persistiert"
 fi
+
+echo ""
+echo "== apt-Host-Pinning =="
+PIN_BIN="$TMP_DIR/pinbin"
+mkdir -p "$PIN_BIN"
+cat > "$PIN_BIN/getent" <<'EOF'
+#!/usr/bin/env sh
+last=""
+for arg in "$@"; do last="$arg"; done
+printf '151.101.1.1 %s\n' "$last"
+EOF
+chmod +x "$PIN_BIN/getent"
+HOSTS_FILE="$TMP_DIR/hosts"
+printf '127.0.0.1 localhost\n' > "$HOSTS_FILE"
+run "apt-hosts-pin --help" bash "$REPO_ROOT/scripts/apt-hosts-pin.sh" --help
+run "apt-hosts-pin pin" env PATH="$PIN_BIN:$PATH" \
+  bash "$REPO_ROOT/scripts/apt-hosts-pin.sh" pin \
+    --hosts-file "$HOSTS_FILE" --hosts "deb.debian.org security.debian.org" --retries 1
+run "Pin-Eintrag für deb.debian.org" grep -qx '151.101.1.1 deb.debian.org' "$HOSTS_FILE"
+run "bestehende hosts-Einträge bleiben" grep -qx '127.0.0.1 localhost' "$HOSTS_FILE"
+env PATH="$PIN_BIN:$PATH" bash "$REPO_ROOT/scripts/apt-hosts-pin.sh" pin \
+  --hosts-file "$HOSTS_FILE" --hosts "deb.debian.org security.debian.org" --retries 1 >/dev/null 2>&1
+if [[ "$(grep -c '>>> tolaria-apt-hosts >>>' "$HOSTS_FILE")" == "1" ]]; then
+  pass "Pin ist idempotent"
+else
+  fail "Pin ist idempotent"
+fi
+run "apt-hosts-pin unpin" bash "$REPO_ROOT/scripts/apt-hosts-pin.sh" unpin --hosts-file "$HOSTS_FILE"
+if ! grep -q 'tolaria-apt-hosts' "$HOSTS_FILE" && grep -qx '127.0.0.1 localhost' "$HOSTS_FILE"; then
+  pass "unpin entfernt nur den eigenen Block"
+else
+  fail "unpin entfernt nur den eigenen Block"
+fi
+run "unpin ist idempotent" bash "$REPO_ROOT/scripts/apt-hosts-pin.sh" unpin --hosts-file "$HOSTS_FILE"
+if bash "$REPO_ROOT/scripts/apt-hosts-pin.sh" bogus >/dev/null 2>&1; then
+  fail "ungültige Aktion wird abgelehnt"
+else
+  pass "ungültige Aktion wird abgelehnt"
+fi
 if bash "$REPO_ROOT/scripts/repair-dns.sh" --servers "8.8.8.8 && echo pwned" \
      --resolv-conf "$DNS_CONF" --skip-check >/dev/null 2>&1; then
   fail "ungültiger Nameserver wird abgelehnt"
@@ -318,6 +357,9 @@ run "Host: Nameserver dauerhaft in CT-Config" grep -Fq 'pct set "$CTID" --namese
 run "Host: persistiert effektive CT-Nameserver" grep -Fq 'CT_DNS_EFFECTIVE' "$HOST_INST"
 run "Host: liest Nameserver aus CT-resolv.conf" grep -Fq "awk '/^nameserver" "$HOST_INST"
 run "Host: repair-dns.sh wird in den CT gepusht" grep -q 'repair-dns.sh' "$HOST_INST"
+run "Host: apt-hosts-pin.sh im Packaging" grep -q 'scripts/apt-hosts-pin.sh' "$HOST_INST"
+run "Setup: apt-Hosts werden gepinnt" grep -q 'apt-hosts-pin.sh' "$CT_SETUP"
+run "Setup: Pinning wird entfernt" grep -qF '"$APT_HOSTS_PIN" unpin' "$CT_SETUP"
 run "Host: Nameserver beim pct create" grep -q -- '--nameserver "\$CT_DNS"' "$HOST_INST"
 run "Setup: DNS-Guard vor apt" grep -q 'REPAIR_DNS.*--servers' "$CT_SETUP"
 run "Setup: DNS-Guard persistiert dhclient" grep -q -- '--persist-dhclient' "$CT_SETUP"

@@ -182,16 +182,66 @@ fi
 TOLARIA_DNS_SERVERS="$EFFECTIVE_DNS"
 
 # ---------------------------------------------------------------------------
+# apt-Hosts vorab auflösen
+# ---------------------------------------------------------------------------
+# In manchen LXC-Netzen antwortet der Resolver bei einzelnen Anfragen sauber,
+# scheitert aber unter der Last vieler paralleler apt-Downloads (NAT/Conntrack,
+# Rate-Limits). "Temporary failure resolving" trotz funktionierendem getent
+# ist dann die Folge. Die apt-Hosts werden deshalb für die Dauer der
+# Paketinstallation in /etc/hosts gepinnt und danach wieder entfernt.
+APT_HOSTS_PIN="${PKG_DIR}/apt-hosts-pin.sh"
+APT_HOSTS_PINNED=0
+
+pin_apt_hosts() {
+  APT_HOSTS_PINNED=0
+  [[ -f "$APT_HOSTS_PIN" ]] || return 0
+  if bash "$APT_HOSTS_PIN" pin; then
+    APT_HOSTS_PINNED=1
+  else
+    msg_warn "Host-Pinning fehlgeschlagen - apt nutzt DNS."
+  fi
+}
+
+unpin_apt_hosts() {
+  APT_HOSTS_PINNED=0
+  [[ -f "$APT_HOSTS_PIN" ]] || return 0
+  bash "$APT_HOSTS_PIN" unpin >/dev/null 2>&1 || true
+}
+trap 'unpin_apt_hosts' EXIT
+
+# ---------------------------------------------------------------------------
 # Pakete
 # ---------------------------------------------------------------------------
 msg_info "Aktualisiere Paketlisten und installiere Systempakete ..."
 export DEBIAN_FRONTEND=noninteractive
 
+pin_apt_hosts
+
 # apt-get update kann mit Exit 0 enden, obwohl ALLE Indexe nicht geladen
 # wurden ("W: Failed to fetch ... Some index files failed to download").
 # Deshalb wird die Ausgabe geprüft und der Fall explizit behandelt.
-if ! retry 3 5 apt-get update "${APT_OPTS[@]}" >"$APT_LOG" 2>&1; then
-  cat "$APT_LOG"
+apt_update_once() {
+  apt-get update "${APT_OPTS[@]}" >"$APT_LOG" 2>&1
+}
+
+apt_log_has_fetch_errors() {
+  [[ -s "$APT_LOG" ]] && grep -qE 'Failed to fetch|Temporary failure resolving|Could not resolve' "$APT_LOG"
+}
+
+update_ok=0
+if retry 3 5 apt_update_once; then
+  update_ok=1
+fi
+if (( update_ok == 0 )) && (( APT_HOSTS_PINNED )); then
+  msg_warn "apt-get update mit vorab aufgelösten Hosts fehlgeschlagen - versuche ohne Pin ..."
+  unpin_apt_hosts
+  if retry 2 5 apt_update_once; then
+    update_ok=1
+  fi
+fi
+
+if (( update_ok == 0 )); then
+  cat "$APT_LOG" 2>/dev/null || true
   msg_error "apt-get update ist fehlgeschlagen (DNS, Proxy oder Mirror-Problem)."
   msg_error "Nameserver: ${TOLARIA_DNS_SERVERS}"
   msg_error "IPv4/A: $(getent ahostsv4 deb.debian.org 2>&1 | awk 'NR<=2 {print $1}' | paste -sd' ' - || true)"
@@ -200,7 +250,7 @@ if ! retry 3 5 apt-get update "${APT_OPTS[@]}" >"$APT_LOG" 2>&1; then
   exit 1
 fi
 
-if grep -qE 'Failed to fetch|Temporary failure resolving|Could not resolve' "$APT_LOG"; then
+if apt_log_has_fetch_errors; then
   msg_warn "apt-get update meldet Fetch-Fehler - prüfe, ob die Pakete trotzdem auflösbar sind ..."
   if apt-get install -y --simulate --no-install-recommends "${APT_OPTS[@]}" "${APT_PACKAGES[@]}" >/dev/null 2>&1; then
     msg_warn "Paketauflösung funktioniert trotz Fetch-Warnungen - fahre fort."
@@ -229,6 +279,10 @@ fi
 
 if ! retry 3 10 apt_install_packages; then
   msg_warn "Erster Installationsversuch fehlgeschlagen - aktualisiere Listen und versuche es mit --fix-missing erneut ..."
+  if (( APT_HOSTS_PINNED )); then
+    msg_warn "Entferne Host-Pinning und versuche die Auflösung wieder über DNS ..."
+    unpin_apt_hosts
+  fi
   retry 2 10 apt-get update "${APT_OPTS[@]}" >>"$APT_LOG" 2>&1 || msg_warn "apt-get update beim zweiten Versuch fehlgeschlagen."
   if ! apt-get install -y --no-install-recommends --fix-missing "${APT_OPTS[@]}" "${APT_PACKAGES[@]}"; then
     msg_error "Systempakete konnten nicht installiert werden."
@@ -240,6 +294,7 @@ if ! retry 3 10 apt_install_packages; then
     exit 1
   fi
 fi
+unpin_apt_hosts
 msg_ok "Systempakete installiert."
 
 # --fix-missing kann fehlende Pakete stillschweigend überspringen. Deshalb
@@ -270,6 +325,7 @@ fi
 
 if [[ "$need_node" == "1" ]]; then
   msg_info "Installiere Node.js 22.x von NodeSource ..."
+  pin_apt_hosts
   if ! retry 3 5 curl -fsSL --max-time 60 https://deb.nodesource.com/setup_22.x -o /tmp/nodesource_setup.sh; then
     msg_error "NodeSource-Setup konnte nicht geladen werden (https://deb.nodesource.com)."
     msg_error "Prüfe DNS/Internet/Proxy im Container."
@@ -281,6 +337,7 @@ if [[ "$need_node" == "1" ]]; then
     msg_error "Node.js konnte nicht installiert werden."
     exit 1
   fi
+  unpin_apt_hosts
 else
   msg_ok "Node.js $(node --version) bereits vorhanden."
 fi
