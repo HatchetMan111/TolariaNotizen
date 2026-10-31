@@ -248,6 +248,10 @@ Das Pinning steckt sowohl in `scripts/apt-hosts-pin.sh` als auch als eingebauter
 
 Zusätzlich prüft der Installer mit einem Sentinel-Hostnamen, ob die Namensauflösung `/etc/hosts` überhaupt liest. Steht in `/etc/nsswitch.conf` z. B. `hosts: resolve ...` oder `hosts: dns files`, liefert `getent` zwar eine IP (und der Pin sieht „verifiziert“ aus), apt fragt aber weiter DNS. In diesem Fall setzt der Installer die `hosts:`-Zeile auf `hosts: files dns` (Backup: `/etc/nsswitch.conf.tolaria.bak`). Außerdem gilt für alle apt-Aufrufe im Container `/etc/apt/apt.conf.d/99tolaria-network` mit `Acquire::ForceIPv4`, Retries, Timeouts und reduzierter Parallelität (`Queue-Mode access`).
 
+Ein weiterer Stolperstein sind die Dateirechte: apt lädt als Benutzer `_apt`. Ist `/etc/hosts` nur für root lesbar (z. B. Modus 600), sieht `getent` als root den Pin, apt aber nicht. Der Installer setzt `/etc/hosts` deshalb auf 644, prüft die Lesbarkeit als `_apt` und hat als letzten Fallback einen apt-Lauf ohne `_apt`-Sandbox (`APT::Sandbox::User=root`).
+
+Falls apt trotz verifiziertem Pin weiter DNS fragt, startet der Installer zusätzlich einen **lokalen apt-Proxy** ([scripts/apt-proxy.pl](scripts/apt-proxy.pl)) auf `127.0.0.1:3142`. Er bekommt die gepinnten IPs als Mapping, leitet HTTP und HTTPS-CONNECT dorthin weiter und umgeht damit apts eigenen Resolver vollständig. Der Proxy läuft nur während der Installation; danach werden Konfiguration und Prozess entfernt. Voraussetzung ist `perl-base` (in Debian 12 enthalten); fehlt Perl, läuft apt wie bisher direkt.
+
 Schlägt apt trotz aktiven Pins fehl, bleibt der Pin zunächst aktiv und der Installer versucht es mit frischen Listen erneut. Erst wenn das ebenfalls scheitert, entfernt er den Pin für einen letzten DNS-Versuch. Die Diagnose (Pin-Block, A/AAAA, Proxy-Schlüssel, letzte apt-Zeilen) landet im Build-Log; die apt-Rohausgabe steht in `/root/tolaria-apt-update.log`.
 
 Manuell prüfen:
@@ -350,6 +354,7 @@ install/tolaria.sh              Host-Installer (Proxmox)
 scripts/setup-in-container.sh   Build/Setup im LXC
 scripts/repair-dns.sh           DNS-Check/-Reparatur im Container
 scripts/apt-hosts-pin.sh        apt-Hosts temporär in /etc/hosts pinnen
+scripts/apt-proxy.pl            lokaler apt-Proxy (127.0.0.1:3142) für gepinnte IPs
 scripts/inject-web-config.py    idempotente HTML-Injection
 scripts/seed-vault.sh           bare Git-Vault seeden
 systemd/tolaria.service         systemd-Unit
@@ -375,6 +380,7 @@ In dieser Umgebung wurde **kein echter Proxmox-Host** ausgeführt. Validiert wur
 - Eingebauter Pinning-Fallback in `setup-in-container.sh` (funktional getestet), damit ein veraltetes Host-Skript das Pinning nicht aushebeln kann
 - `ensure_hosts_lookup`: Sentinel-Test und Korrektur von `nsswitch.conf` auf `hosts: files dns` (funktional mit kontrolliertem `getent` getestet)
 - apt-Grundeinstellungen im Container: `ForceIPv4`, Retries, Timeouts und `Queue-Mode access`
+- Lokaler apt-Proxy (`scripts/apt-proxy.pl`): HTTP-Weiterleitung über Host-Mapping funktional getestet, inklusive HTTPS-`CONNECT` (manuell mit lokalem TLS-Server)
 - Verifikation des Pins über `getent ahostsv4` plus `/etc/hosts`-Abgleich; apt versucht bei Fehlern zuerst erneut mit Pin und entfernt ihn erst für den letzten DNS-Versuch
 - Packaging als atomarer Tarball inkl. Cache-Buster und Raw-Fallback: lokaler Tarball, `file://`-Tarball und echter `codeload.github.com`-Download getestet
 - Persistenz der tatsächlich funktionierenden Nameserver in der CT-Config (statisch geprüft); wird jetzt auch bei bereits funktionierendem DNS geschrieben

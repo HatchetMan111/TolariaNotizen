@@ -65,6 +65,11 @@ on_error() {
     msg_error "--- apt-Update-Log (letzte 40 Zeilen) ---"
     tail -n 40 /root/tolaria-apt-update.log 2>&1 || true
   fi
+  if [[ -f /root/tolaria-apt-proxy.log ]]; then
+    echo ""
+    msg_error "--- apt-Proxy-Log (letzte 20 Zeilen) ---"
+    tail -n 20 /root/tolaria-apt-proxy.log 2>&1 || true
+  fi
   echo ""
   msg_error "--- nginx -t ---"
   nginx -t 2>&1 || true
@@ -232,6 +237,11 @@ APT_HOSTS_PIN="${PKG_DIR}/apt-hosts-pin.sh"
 APT_HOSTS_PINNED=0
 APT_HOSTS_FILE="${APT_HOSTS_FILE:-/etc/hosts}"
 NSSWITCH_FILE="${NSSWITCH_FILE:-/etc/nsswitch.conf}"
+APT_PROXY_PL="${PKG_DIR}/apt-proxy.pl"
+APT_PROXY_PORT="${APT_PROXY_PORT:-3142}"
+APT_PROXY_CONF="/etc/apt/apt.conf.d/99tolaria-proxy"
+APT_PROXY_PID=""
+APT_PROXY_ACTIVE=0
 APT_HOSTS_BEGIN="# >>> tolaria-apt-hosts >>>"
 APT_HOSTS_END="# <<< tolaria-apt-hosts <<<"
 APT_HOSTS_LIST="deb.debian.org security.debian.org deb.nodesource.com"
@@ -275,6 +285,9 @@ apt_hosts_pin_inline() {
     printf '%s\n' "${entries[@]}"
     printf '%s\n' "$APT_HOSTS_END"
   } >> "$APT_HOSTS_FILE"
+  # apt liest /etc/hosts beim Download als _apt; Modus 600 würde den Pin
+  # für apt unsichtbar machen, obwohl getent als root ihn sieht.
+  chmod 644 "$APT_HOSTS_FILE" 2>/dev/null || true
   msg_ok "apt-Hosts gepinnt (eingebauter Fallback): ${entries[*]}"
 }
 
@@ -387,8 +400,63 @@ unpin_apt_hosts() {
   # oder veralteten apt-hosts-pin.sh kein Marker in /etc/hosts zurück.
   apt_hosts_remove_block >/dev/null 2>&1 || true
 }
+
+# Letzte Verteidigungslinie: Ein lokaler Proxy, der die gepinnten IPs selbst
+# anspricht. Damit ist apt complete unabhängig davon, ob es /etc/hosts liest.
+start_apt_proxy() {
+  (( APT_PROXY_ACTIVE )) && return 0
+  APT_PROXY_ACTIVE=0
+  command -v perl >/dev/null 2>&1 \
+    || { msg_warn "perl fehlt - apt-Proxy nicht verfügbar."; return 1; }
+  [[ -f "$APT_PROXY_PL" ]] \
+    || { msg_warn "apt-proxy.pl fehlt (veraltetes Packaging?) - kein apt-Proxy."; return 1; }
+
+  local map="$PKG_DIR/apt-hosts.map"
+  awk -v b="$APT_HOSTS_BEGIN" -v e="$APT_HOSTS_END" '
+    $0 == b { inblock = 1; next }
+    $0 == e { inblock = 0; next }
+    inblock && NF >= 2 { print $2, $1 }
+  ' "$APT_HOSTS_FILE" > "$map"
+  if [[ ! -s "$map" ]]; then
+    msg_warn "Kein Host-Mapping für den apt-Proxy - nutze direkte Verbindungen."
+    return 1
+  fi
+
+  perl "$APT_PROXY_PL" --port "$APT_PROXY_PORT" --map "$map" \
+    >/root/tolaria-apt-proxy.log 2>&1 &
+  APT_PROXY_PID=$!
+  sleep 0.3
+  if ! kill -0 "$APT_PROXY_PID" 2>/dev/null; then
+    msg_warn "apt-Proxy startet nicht: $(tail -n1 /root/tolaria-apt-proxy.log 2>/dev/null || true)"
+    APT_PROXY_PID=""
+    return 1
+  fi
+
+  {
+    printf 'Acquire::http::Proxy "http://127.0.0.1:%s";\n' "$APT_PROXY_PORT"
+    printf 'Acquire::https::Proxy "http://127.0.0.1:%s";\n' "$APT_PROXY_PORT"
+  } > "$APT_PROXY_CONF"
+  chmod 644 "$APT_PROXY_CONF"
+  APT_PROXY_ACTIVE=1
+  msg_ok "apt-Proxy aktiv (127.0.0.1:${APT_PROXY_PORT}, $(wc -l < "$map") Hosts)."
+}
+
+stop_apt_proxy() {
+  if [[ -n "$APT_PROXY_PID" ]]; then
+    kill "$APT_PROXY_PID" 2>/dev/null || true
+    wait "$APT_PROXY_PID" 2>/dev/null || true
+    APT_PROXY_PID=""
+  fi
+  rm -f "$APT_PROXY_CONF"
+  APT_PROXY_ACTIVE=0
+}
+
+cleanup_apt() {
+  stop_apt_proxy
+  unpin_apt_hosts
+}
 # <<< tolaria-inline-pin <<<
-trap 'unpin_apt_hosts' EXIT
+trap cleanup_apt EXIT
 
 # ---------------------------------------------------------------------------
 # Pakete
@@ -396,7 +464,11 @@ trap 'unpin_apt_hosts' EXIT
 msg_info "Aktualisiere Paketlisten und installiere Systempakete ..."
 export DEBIAN_FRONTEND=noninteractive
 
-pin_apt_hosts || msg_warn "Weiter ohne verifizierten Pin - apt nutzt DNS (anfällig)."
+if pin_apt_hosts; then
+  start_apt_proxy || msg_warn "apt-Proxy nicht verfügbar - apt nutzt direkte Verbindungen."
+else
+  msg_warn "Weiter ohne verifizierten Pin - apt nutzt DNS (anfällig)."
+fi
 
 # apt-get update kann mit Exit 0 enden, obwohl ALLE Indexe nicht geladen
 # wurden ("W: Failed to fetch ... Some index files failed to download").
@@ -417,12 +489,27 @@ apt_diag() {
   msg_error "IPv4/A: $(getent ahostsv4 deb.debian.org 2>&1 | awk 'NR<=2 {print $1}' | paste -sd' ' - || true)"
   msg_error "IPv6/AAAA: $(getent ahostsv6 deb.debian.org 2>&1 | awk 'NR<=2 {print $1}' | paste -sd' ' - || true)"
   msg_error "Pin aktiv: ${APT_HOSTS_PINNED}"
+  msg_error "hosts-Rechte: $(stat -c '%a %U:%G %n' "$APT_HOSTS_FILE" 2>/dev/null || echo 'nicht lesbar')"
+  cp -a "$APT_HOSTS_FILE" /root/tolaria-hosts.debug 2>/dev/null || true
+  if id -u _apt >/dev/null 2>&1; then
+    if runuser -u _apt -- test -r "$APT_HOSTS_FILE" 2>/dev/null; then
+      msg_error "_apt kann ${APT_HOSTS_FILE} lesen: ja"
+    else
+      msg_error "_apt kann ${APT_HOSTS_FILE} lesen: NEIN (apt ignoriert den Pin)"
+    fi
+    runuser -u _apt -- getent ahostsv4 deb.debian.org 2>&1 \
+      | awk 'NR<=2 {print "  _apt getent: " $1}' || true
+  fi
   if [[ -f "$APT_HOSTS_FILE" ]] && grep -qF "$APT_HOSTS_BEGIN" "$APT_HOSTS_FILE"; then
     msg_error "--- /etc/hosts (Pin-Block) ---"
     grep -A6 -F "$APT_HOSTS_BEGIN" "$APT_HOSTS_FILE" 2>/dev/null || true
   fi
   msg_error "--- apt-Proxy (nur gesetzte Schlüssel) ---"
   apt-config dump 2>/dev/null | awk '/Proxy/ {print "  " $1 " <gesetzt>"}' || true
+  msg_error "Lokaler apt-Proxy aktiv: ${APT_PROXY_ACTIVE}"
+  if [[ -f /root/tolaria-apt-proxy.log ]]; then
+    tail -n 10 /root/tolaria-apt-proxy.log 2>/dev/null || true
+  fi
   msg_error "--- /etc/resolv.conf ---"
   cat /etc/resolv.conf 2>/dev/null || true
   msg_error "--- letzte ${APT_LOG##*/}-Zeilen ---"
@@ -432,6 +519,13 @@ apt_diag() {
 update_ok=0
 if retry 3 5 apt_update_once; then
   update_ok=1
+fi
+if (( update_ok == 0 )) && (( APT_PROXY_ACTIVE )); then
+  msg_warn "apt-Update über den lokalen Proxy fehlgeschlagen - stoppe Proxy und versuche direkt ..."
+  stop_apt_proxy
+  if retry 2 5 apt_update_once; then
+    update_ok=1
+  fi
 fi
 if (( update_ok == 0 )) && (( APT_HOSTS_PINNED )); then
   msg_warn "apt-get update mit verifiziertem Host-Pinning fehlgeschlagen - teste DNS als Gegenprobe ..."
@@ -493,10 +587,26 @@ fi
 # (z. B. blockiertes Fastly-Subnetz). Dann zurück auf DNS.
 if (( install_ok == 0 )) && (( APT_HOSTS_PINNED )); then
   msg_warn "Mit gepinnten Hosts weiterhin Fehler - letzter Versuch über DNS ..."
+  stop_apt_proxy
   unpin_apt_hosts
   retry 2 10 apt_update_once || msg_warn "apt-get update über DNS fehlgeschlagen."
   if apt-get install -y --no-install-recommends --fix-missing "${APT_OPTS[@]}" "${APT_PACKAGES[@]}"; then
     install_ok=1
+  fi
+fi
+
+# Manche Container haben ein /etc/hosts, das _apt nicht lesen darf. getent
+# als root sieht den Pin dann, apt als _apt aber nicht. Der Pin wird dafür
+# erneut gesetzt und apt ohne Sandbox-User gestartet.
+if (( install_ok == 0 )) && (( APT_HOSTS_PINNED == 0 )); then
+  msg_warn "Letzter Versuch: Pin erneut setzen und apt ohne _apt-Sandbox ausführen ..."
+  if pin_apt_hosts; then
+    apt-get update "${APT_OPTS[@]}" -o APT::Sandbox::User=root >"$APT_LOG" 2>&1 \
+      || msg_warn "apt-get update ohne _apt-Sandbox fehlgeschlagen."
+    if apt-get install -y --no-install-recommends "${APT_OPTS[@]}" \
+         -o APT::Sandbox::User=root "${APT_PACKAGES[@]}"; then
+      install_ok=1
+    fi
   fi
 fi
 
@@ -538,7 +648,11 @@ fi
 
 if [[ "$need_node" == "1" ]]; then
   msg_info "Installiere Node.js 22.x von NodeSource ..."
-  pin_apt_hosts || msg_warn "NodeSource-Pin nicht verifiziert - nutze DNS."
+  if pin_apt_hosts; then
+    start_apt_proxy || msg_warn "apt-Proxy für NodeSource nicht verfügbar - nutze direkte Verbindungen."
+  else
+    msg_warn "NodeSource-Pin nicht verifiziert - nutze DNS."
+  fi
   if ! retry 3 5 curl -fsSL --max-time 60 https://deb.nodesource.com/setup_22.x -o /tmp/nodesource_setup.sh; then
     msg_error "NodeSource-Setup konnte nicht geladen werden (https://deb.nodesource.com)."
     msg_error "Prüfe DNS/Internet/Proxy im Container."

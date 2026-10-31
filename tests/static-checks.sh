@@ -333,6 +333,7 @@ cp "$REPO_ROOT/scripts/inject-web-config.py" "$PKG_SNAP/scripts/"
 cp "$REPO_ROOT/scripts/seed-vault.sh" "$PKG_SNAP/scripts/"
 cp "$REPO_ROOT/scripts/repair-dns.sh" "$PKG_SNAP/scripts/"
 cp "$REPO_ROOT/scripts/apt-hosts-pin.sh" "$PKG_SNAP/scripts/"
+cp "$REPO_ROOT/scripts/apt-proxy.pl" "$PKG_SNAP/scripts/"
 cp "$REPO_ROOT/systemd/tolaria.service" "$PKG_SNAP/systemd/"
 cp "$REPO_ROOT/nginx/tolaria.conf" "$PKG_SNAP/nginx/"
 PKG_TARBALL="$TMP_DIR/packaging.tar.gz"
@@ -360,6 +361,7 @@ PACKAGING_FILES=(
   "scripts/seed-vault.sh"
   "scripts/repair-dns.sh"
   "scripts/apt-hosts-pin.sh"
+  "scripts/apt-proxy.pl"
   "systemd/tolaria.service"
   "nginx/tolaria.conf"
 )
@@ -381,6 +383,32 @@ if bash "$PKG_FETCH_HARNESS" "$TMP_DIR/pkg-target-bad" "$TMP_DIR/does-not-exist.
   fail "defekter Packaging-Tarball wird abgelehnt"
 else
   pass "defekter Packaging-Tarball wird abgelehnt"
+fi
+
+echo ""
+echo "== apt-Proxy =="
+if command -v perl >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then
+  PROXY_WWW="$TMP_DIR/proxy-www"
+  mkdir -p "$PROXY_WWW"
+  printf 'hello-through-apt-proxy\n' > "$PROXY_WWW/hello.txt"
+  printf 'proxy.test 127.0.0.1\n' > "$TMP_DIR/proxy.map"
+  python3 -m http.server 18081 --directory "$PROXY_WWW" >/dev/null 2>&1 &
+  HTTP_PID=$!
+  perl "$REPO_ROOT/scripts/apt-proxy.pl" --port 13143 --map "$TMP_DIR/proxy.map" \
+    >"$TMP_DIR/proxy.log" 2>&1 &
+  PROXY_PID=$!
+  sleep 0.6
+  BODY="$(curl -sS -m 5 -x http://127.0.0.1:13143 http://proxy.test:18081/hello.txt 2>/dev/null || true)"
+  if [[ "$BODY" == "hello-through-apt-proxy" ]]; then
+    pass "apt-Proxy leitet HTTP über das Host-Mapping"
+  else
+    fail "apt-Proxy leitet HTTP über das Host-Mapping"
+    sed -n '1,10p' "$TMP_DIR/proxy.log" 2>/dev/null || true
+  fi
+  kill "$PROXY_PID" "$HTTP_PID" 2>/dev/null || true
+  wait "$PROXY_PID" "$HTTP_PID" 2>/dev/null || true
+else
+  echo "[SKIP] apt-Proxy (perl oder curl fehlt)"
 fi
 if bash "$REPO_ROOT/scripts/repair-dns.sh" --servers "8.8.8.8 && echo pwned" \
      --resolv-conf "$DNS_CONF" --skip-check >/dev/null 2>&1; then
@@ -549,6 +577,9 @@ run "Host: persistiert effektive CT-Nameserver" grep -Fq 'CT_DNS_EFFECTIVE' "$HO
 run "Host: liest Nameserver aus CT-resolv.conf" grep -Fq "awk '/^nameserver" "$HOST_INST"
 run "Host: repair-dns.sh wird in den CT gepusht" grep -q 'repair-dns.sh' "$HOST_INST"
 run "Host: apt-hosts-pin.sh im Packaging" grep -q 'scripts/apt-hosts-pin.sh' "$HOST_INST"
+run "Host: apt-proxy.pl im Packaging" grep -q 'scripts/apt-proxy.pl' "$HOST_INST"
+run "Setup: lokaler apt-Proxy vorhanden" grep -q 'start_apt_proxy' "$CT_SETUP"
+run "Setup: Proxy wird aufgeräumt" grep -q 'cleanup_apt' "$CT_SETUP"
 run "Host: Packaging als atomarer Tarball" grep -q 'codeload.github.com' "$HOST_INST"
 run "Host: Cache-Buster fuer Downloads" grep -q 'cache_busted_url' "$HOST_INST"
 run "Host: Raw-Download als Fallback" grep -q 'fetch_packaging_raw' "$HOST_INST"
@@ -562,7 +593,9 @@ run "Setup: hosts-Auflösung wird geprüft" grep -q 'ensure_hosts_lookup' "$CT_S
 run "Setup: nsswitch wird korrigiert" grep -q 'NSSWITCH_FILE' "$CT_SETUP"
 run "Setup: apt nutzt immer IPv4" grep -q 'Acquire::ForceIPv4 "true"' "$CT_SETUP"
 run "Setup: apt-Parallelität reduziert" grep -q 'Acquire::Queue-Mode "access"' "$CT_SETUP"
-run "Setup: Pin-Fehler bricht Setup nicht ab" grep -q 'pin_apt_hosts || msg_warn' "$CT_SETUP"
+run "Setup: hosts-Datei wird fuer _apt lesbar gemacht" grep -q 'chmod 644 "$APT_HOSTS_FILE"' "$CT_SETUP"
+run "Setup: letzter Fallback ohne _apt-Sandbox" grep -q 'APT::Sandbox::User=root' "$CT_SETUP"
+run "Setup: Pin-Fehler bricht Setup nicht ab" grep -q 'if pin_apt_hosts; then' "$CT_SETUP"
 run "Setup: mehrere A-Records pro Host" grep -q 'head -n2' "$CT_SETUP"
 run "Setup: apt-Diagnose vorhanden" grep -q 'apt_diag' "$CT_SETUP"
 run "Setup: dpkg-Lock-Timeout" grep -q 'DPkg::Lock::Timeout' "$CT_SETUP"

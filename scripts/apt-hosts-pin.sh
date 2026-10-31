@@ -137,6 +137,10 @@ pin() {
     printf '%s\n' "${entries[@]}"
     echo "$MARK_END"
   } >> "$HOSTS_FILE"
+  # apt liest /etc/hosts beim Download als Benutzer "_apt". Eine Datei mit
+  # Modus 600 (z. B. durch ein restriktives umask) ist für _apt nicht lesbar;
+  # getent als root funktioniert dann, apt fragt aber weiter DNS.
+  chmod 644 "$HOSTS_FILE" 2>/dev/null || true
   msg_ok "apt-Hosts gepinnt: ${entries[*]}"
 }
 

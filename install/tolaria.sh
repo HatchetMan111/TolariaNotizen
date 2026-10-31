@@ -469,6 +469,7 @@ PACKAGING_FILES=(
   "scripts/seed-vault.sh"
   "scripts/repair-dns.sh"
   "scripts/apt-hosts-pin.sh"
+  "scripts/apt-proxy.pl"
   "systemd/tolaria.service"
   "nginx/tolaria.conf"
 )
