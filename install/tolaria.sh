@@ -179,8 +179,10 @@ on_error() {
     if pct status "${CTID}" 2>/dev/null | grep -q running; then
       msg_error "--- DNS / Netzwerk im Container ---"
       pct exec "${CTID}" -- bash -c 'cat /etc/resolv.conf' 2>&1 || true
-      pct exec "${CTID}" -- bash -c 'getent hosts deb.debian.org || echo "DNS-Auflösung fehlgeschlagen"' 2>&1 || true
+      pct exec "${CTID}" -- bash -c 'getent ahostsv4 deb.debian.org || echo "IPv4-Aufloesung fehlgeschlagen"' 2>&1 || true
+      pct exec "${CTID}" -- bash -c 'getent ahostsv6 deb.debian.org || echo "IPv6-Aufloesung fehlgeschlagen"' 2>&1 || true
       pct exec "${CTID}" -- bash -c 'ip -4 route 2>/dev/null; ip -4 addr show dev eth0 2>/dev/null' 2>&1 || true
+      pct exec "${CTID}" -- bash -c 'if [ -f /etc/dhcp/dhclient.conf ]; then grep -n "tolaria-dns\|domain-name-servers" /etc/dhcp/dhclient.conf || true; fi' 2>&1 || true
       echo ""
       msg_error "--- systemctl status ${APP} ---"
       pct exec "${CTID}" -- systemctl status "${APP}" --no-pager --full 2>&1 || true
@@ -568,11 +570,11 @@ pct push "$CTID" "$PKG_DIR/repair-dns.sh" /root/tolaria-repair-dns.sh
 pct exec "$CTID" -- chmod 755 /root/tolaria-repair-dns.sh
 
 dns_was_broken=0
-if ! pct exec "$CTID" -- getent hosts deb.debian.org >/dev/null 2>&1; then
+if ! pct exec "$CTID" -- getent ahostsv4 deb.debian.org >/dev/null 2>&1; then
   dns_was_broken=1
 fi
 
-if ! pct exec "$CTID" -- bash /root/tolaria-repair-dns.sh --servers "$CT_DNS"; then
+if ! pct exec "$CTID" -- bash /root/tolaria-repair-dns.sh --servers "$CT_DNS" --persist-dhclient; then
   msg_error "DNS-Auflösung im Container funktioniert nicht - Installation abgebrochen."
   msg_error "Aktuelle /etc/resolv.conf im Container:"
   pct exec "$CTID" -- cat /etc/resolv.conf 2>&1 || true
@@ -581,6 +583,7 @@ if ! pct exec "$CTID" -- bash /root/tolaria-repair-dns.sh --servers "$CT_DNS"; t
   msg_error "  pct set ${CTID} --nameserver \"${CT_DNS}\""
   msg_error "  pct exec ${CTID} -- bash -c 'printf \"nameserver ${CT_DNS%% *}\\n\" > /etc/resolv.conf'"
   msg_error "  pct reboot ${CTID}"
+  msg_error "Wichtig: apt braucht IPv4/A-Records; reine AAAA-Antworten genügen nicht."
   msg_error "Falls das LAN keinen öffentlichen DNS erlaubt: --dns \"<LAN-DNS>\" verwenden."
   exit 1
 fi

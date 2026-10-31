@@ -79,12 +79,79 @@ run "repair-dns --help" bash "$REPO_ROOT/scripts/repair-dns.sh" --help
 bash "$REPO_ROOT/scripts/repair-dns.sh" --help > "$TMP_DIR/repair-help.txt"
 run "repair-dns --help nennt --fallback-servers" \
   grep -q -- '--fallback-servers' "$TMP_DIR/repair-help.txt"
+run "repair-dns --help nennt --persist-dhclient" \
+  grep -q -- '--persist-dhclient' "$TMP_DIR/repair-help.txt"
+run "repair-dns prueft IPv4/A-Records" grep -q 'getent ahostsv4' "$REPO_ROOT/scripts/repair-dns.sh"
 run "repair-dns schreibt Nameserver" \
   bash "$REPO_ROOT/scripts/repair-dns.sh" --servers "1.1.1.1 9.9.9.9" \
     --resolv-conf "$DNS_CONF" --skip-check
 run "resolv.conf enthält 1.1.1.1" grep -qx 'nameserver 1.1.1.1' "$DNS_CONF"
 run "resolv.conf enthält 9.9.9.9" grep -qx 'nameserver 9.9.9.9' "$DNS_CONF"
 run "resolv.conf enthält options" grep -q '^options ' "$DNS_CONF"
+
+# DHCP darf die Nameserver nicht wieder überschreiben (supersede), und ein
+# zweiter Lauf darf keinen doppelten Block erzeugen.
+DHCLIENT_CONF="$TMP_DIR/dhclient.conf"
+printf 'send host-name = gethostname();\n' > "$DHCLIENT_CONF"
+run "persist-dhclient schreibt supersede" \
+  bash "$REPO_ROOT/scripts/repair-dns.sh" --servers "1.1.1.1 9.9.9.9" \
+    --resolv-conf "$DNS_CONF" --skip-check --persist-dhclient \
+    --dhclient-conf "$DHCLIENT_CONF"
+run "dhclient.conf enthält supersede" \
+  grep -qx 'supersede domain-name-servers 1.1.1.1, 9.9.9.9;' "$DHCLIENT_CONF"
+run "bestehende dhclient.conf bleibt erhalten" \
+  grep -qx 'send host-name = gethostname();' "$DHCLIENT_CONF"
+bash "$REPO_ROOT/scripts/repair-dns.sh" --servers "1.1.1.1 9.9.9.9" \
+  --resolv-conf "$DNS_CONF" --skip-check --persist-dhclient \
+  --dhclient-conf "$DHCLIENT_CONF" >/dev/null 2>&1
+if [[ "$(grep -c '>>> tolaria-dns >>>' "$DHCLIENT_CONF")" == "1" ]]; then
+  pass "persist-dhclient ist idempotent"
+else
+  fail "persist-dhclient ist idempotent"
+fi
+
+# Fehlschlagende Nameserver dürfen eine funktionierende Konfiguration nicht
+# kaputt machen: Original wiederherstellen und dieses festschreiben.
+FAKE_BIN="$TMP_DIR/fakebin"
+mkdir -p "$FAKE_BIN"
+cat > "$FAKE_BIN/getent" <<'EOF'
+#!/usr/bin/env sh
+case "$*" in *localhost*) exit 0 ;; esac
+if grep -qE "$BADPAT" "$WATCH" 2>/dev/null; then exit 2; fi
+exit 0
+EOF
+chmod +x "$FAKE_BIN/getent"
+RESTORE_CONF="$TMP_DIR/restore-resolv.conf"
+RESTORE_DHC="$TMP_DIR/restore-dhclient.conf"
+printf 'nameserver 203.0.113.9\n' > "$RESTORE_CONF"
+: > "$RESTORE_DHC"
+if PATH="$FAKE_BIN:$PATH" WATCH="$RESTORE_CONF" BADPAT='198\.51\.100\.' \
+   bash "$REPO_ROOT/scripts/repair-dns.sh" --servers "198.51.100.1" \
+     --fallback-servers "198.51.100.2" --resolv-conf "$RESTORE_CONF" \
+     --persist-dhclient --dhclient-conf "$RESTORE_DHC" >/dev/null 2>&1 \
+   && grep -qx 'nameserver 203.0.113.9' "$RESTORE_CONF" \
+   && grep -qx 'supersede domain-name-servers 203.0.113.9;' "$RESTORE_DHC"; then
+  pass "funktionierende Konfiguration wird wiederhergestellt"
+else
+  fail "funktionierende Konfiguration wird wiederhergestellt"
+fi
+
+# Kaputte Ausgangslage + kaputte Wunschserver -> Fallback wird geschrieben
+# und ebenfalls gegen DHCP festgeschrieben.
+FALLBACK_CONF="$TMP_DIR/fallback-resolv.conf"
+FALLBACK_DHC="$TMP_DIR/fallback-dhclient.conf"
+printf 'nameserver 203.0.113.9\n' > "$FALLBACK_CONF"
+: > "$FALLBACK_DHC"
+if PATH="$FAKE_BIN:$PATH" WATCH="$FALLBACK_CONF" BADPAT='198\.51\.100\.|203\.0\.113\.' \
+   bash "$REPO_ROOT/scripts/repair-dns.sh" --servers "198.51.100.1" \
+     --fallback-servers "1.1.1.1" --resolv-conf "$FALLBACK_CONF" \
+     --persist-dhclient --dhclient-conf "$FALLBACK_DHC" >/dev/null 2>&1 \
+   && grep -qx 'nameserver 1.1.1.1' "$FALLBACK_CONF" \
+   && grep -qx 'supersede domain-name-servers 1.1.1.1;' "$FALLBACK_DHC"; then
+  pass "Fallback-Nameserver werden persistiert"
+else
+  fail "Fallback-Nameserver werden persistiert"
+fi
 if bash "$REPO_ROOT/scripts/repair-dns.sh" --servers "8.8.8.8 && echo pwned" \
      --resolv-conf "$DNS_CONF" --skip-check >/dev/null 2>&1; then
   fail "ungültiger Nameserver wird abgelehnt"
@@ -252,9 +319,14 @@ run "Host: persistiert effektive CT-Nameserver" grep -Fq 'CT_DNS_EFFECTIVE' "$HO
 run "Host: liest Nameserver aus CT-resolv.conf" grep -Fq "awk '/^nameserver" "$HOST_INST"
 run "Host: repair-dns.sh wird in den CT gepusht" grep -q 'repair-dns.sh' "$HOST_INST"
 run "Host: Nameserver beim pct create" grep -q -- '--nameserver "\$CT_DNS"' "$HOST_INST"
-run "Setup: DNS-Guard vor apt" grep -q 'repair-dns.sh.*--servers' "$CT_SETUP"
+run "Setup: DNS-Guard vor apt" grep -q 'REPAIR_DNS.*--servers' "$CT_SETUP"
+run "Setup: DNS-Guard persistiert dhclient" grep -q -- '--persist-dhclient' "$CT_SETUP"
+run "Setup: prueft IPv4/A-Records vor apt" grep -q 'getent ahostsv4 deb.debian.org' "$CT_SETUP"
 run "Setup: apt-Fetch-Fehler werden erkannt" grep -q 'Failed to fetch' "$CT_SETUP"
 run "Setup: apt-Retries" grep -q 'Acquire::Retries' "$CT_SETUP"
+run "Setup: ForceIPv4 ohne globales IPv6" grep -q 'Acquire::ForceIPv4' "$CT_SETUP"
+run "Setup: zweiter Versuch mit --fix-missing" grep -q -- '--fix-missing' "$CT_SETUP"
+run "Setup: prueft installierte Werkzeuge" grep -q 'missing_cmds' "$CT_SETUP"
 if grep -q 'apt-get update -qq' "$CT_SETUP"; then
   fail "Setup: apt-get update -qq (Fehler würden ignoriert)"
 else

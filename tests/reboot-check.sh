@@ -78,6 +78,17 @@ if [[ "$ACTIVE" == "1" ]]; then pass "tolaria.service ist nach Reboot aktiv"; el
 
 if pct exec "$CTID" -- nginx -t >/dev/null 2>&1; then pass "nginx -t nach Reboot"; else fail "nginx -t nach Reboot"; fi
 
+if pct exec "$CTID" -- getent ahostsv4 deb.debian.org >/dev/null 2>&1; then
+  pass "IPv4-DNS (A-Records) nach Reboot"
+else
+  fail "IPv4-DNS (A-Records) nach Reboot"
+fi
+if pct exec "$CTID" -- grep -q 'supersede domain-name-servers' /etc/dhcp/dhclient.conf 2>/dev/null; then
+  pass "DHCP überschreibt DNS nach Reboot nicht"
+else
+  fail "DHCP-Schutz (supersede) fehlt"
+fi
+
 IP="$(pct exec "$CTID" -- hostname -I 2>/dev/null | awk '{print $1}')"
 [[ -n "$IP" ]] || IP="$(pct exec "$CTID" -- bash -lc "ip -4 -o addr show dev eth0 | awk '{print \$4}' | cut -d/ -f1 | head -n1" 2>/dev/null || true)"
 if [[ -n "$IP" ]]; then pass "Container-IP: ${IP}"; else fail "Container-IP nicht ermittelbar"; fi

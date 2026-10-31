@@ -180,9 +180,12 @@ Vorher Backup erstellen. `pct destroy` löscht den Vault unwiderruflich.
 
 ### `Temporary failure resolving 'deb.debian.org'` / apt Exit-Code 100
 
-Das ist der häufigste Installationsfehler in Proxmox-LXCs. Ursache ist fast immer eine kaputte `/etc/resolv.conf` im Container: Läuft auf dem Host `systemd-resolved`, übernimmt Proxmox den Stub `nameserver 127.0.0.53`, der **innerhalb** des Containers nicht erreichbar ist. Es gibt dann eine Default-Route, aber keine Namensauflösung.
+Das ist der häufigste Installationsfehler in Proxmox-LXCs. Zwei Ursachen treten dabei auf:
 
-Der Installer prüft DNS vor `apt-get` und repariert die Datei automatisch. Schlägt die Reparatur fehl, bricht er mit einer klaren Meldung ab, statt 84 MB Downloads einzeln scheitern zu lassen. Welche Nameserver tatsächlich funktionieren, liest er nach der Reparatur aus dem Container und hinterlegt genau diese dauerhaft via `pct set --nameserver` – auch wenn dafür der öffentliche Fallback `1.1.1.1 9.9.9.9` nötig war.
+1. Läuft auf dem Host `systemd-resolved`, übernimmt Proxmox den Stub `nameserver 127.0.0.53`, der **innerhalb** des Containers nicht erreichbar ist.
+2. Der DHCP-Client im Container (`dhclient`) überschreibt `/etc/resolv.conf` nach dem Start mit den DHCP-Nameservern. Diese liefern in manchen Netzen nur AAAA-Antworten; apt braucht in einem IPv4-only-Container aber A-Records und scheitert dann mit `Temporary failure resolving`, obwohl `getent hosts` scheinbar funktioniert.
+
+Der Installer prüft deshalb die **IPv4-Auflösung** (`getent ahostsv4`) vor `apt-get`, repariert `/etc/resolv.conf` automatisch und schreibt die geprüften Nameserver per `supersede domain-name-servers` in `/etc/dhcp/dhclient.conf`, damit DHCP sie nicht wieder ersetzt. Schlägt die Reparatur fehl, bricht er mit einer klaren Meldung ab, statt 84 MB Downloads einzeln scheitern zu lassen. Welche Nameserver tatsächlich funktionieren, liest er nach der Reparatur aus dem Container und hinterlegt genau diese dauerhaft via `pct set --nameserver` – auch wenn dafür der öffentliche Fallback `1.1.1.1 9.9.9.9` nötig war.
 
 Bereits vorhandenen Container manuell reparieren:
 
@@ -190,9 +193,13 @@ Bereits vorhandenen Container manuell reparieren:
 CTID=106
 pct set "$CTID" --nameserver "1.1.1.1 9.9.9.9"
 pct exec "$CTID" -- bash -c 'printf "nameserver 1.1.1.1\nnameserver 9.9.9.9\noptions timeout:2 attempts:2\n" > /etc/resolv.conf'
+# DHCP daran hindern, die Datei wieder zu überschreiben:
+pct exec "$CTID" -- bash -c 'mkdir -p /etc/dhcp && printf "supersede domain-name-servers 1.1.1.1, 9.9.9.9;\n" >> /etc/dhcp/dhclient.conf'
 pct reboot "$CTID"
-pct exec "$CTID" -- getent hosts deb.debian.org
+pct exec "$CTID" -- getent ahostsv4 deb.debian.org
 ```
+
+Wichtig ist `getent ahostsv4` (nicht `getent hosts`): Nur so sieht man, ob apt die benötigten A-Records bekommt.
 
 Danach den Installer erneut ausführen. In einem LAN ohne öffentlichen DNS die dort gültigen Resolver verwenden:
 
@@ -200,7 +207,7 @@ Danach den Installer erneut ausführen. In einem LAN ohne öffentlichen DNS die 
 DNS_SERVERS="192.168.1.1" bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/TolariaNotizen/main/install/tolaria.sh)"
 ```
 
-`pct set --nameserver` ist wichtig: Ohne den Eintrag in der CT-Config schreibt Proxmox die kaputte Datei beim nächsten Start wieder.
+`pct set --nameserver` ist wichtig: Ohne den Eintrag in der CT-Config schreibt Proxmox die kaputte Datei beim nächsten Start wieder. Der Installer ist idempotent: Bei einem vorhandenen Container genügt ein erneuter Lauf, er repariert DNS und den DHCP-Schutz automatisch.
 
 ### Build schlägt fehl / OOM
 
@@ -273,7 +280,7 @@ Auf dem Proxmox-Host:
 bash tests/reboot-check.sh <CTID> 8080
 ```
 
-Der Test prüft `onboot=1`, `systemctl is-enabled`, rebootet den **Container**, wartet auf den Service und prüft Web-UI, `/healthz`, `/tolaria-config.js`, `/v1/vault` sowie die Persistenz von Vault-HEAD und Server-Daten. Ein echter **Host**-Reboot wird nicht ausgeführt; `onboot=1` wird geprüft, der Host-Neustart muss manuell verifiziert werden.
+Der Test prüft `onboot=1`, `systemctl is-enabled`, rebootet den **Container**, wartet auf den Service und prüft Web-UI, `/healthz`, `/tolaria-config.js`, `/v1/vault`, die IPv4-DNS-Auflösung samt DHCP-Schutz sowie die Persistenz von Vault-HEAD und Server-Daten. Ein echter **Host**-Reboot wird nicht ausgeführt; `onboot=1` wird geprüft, der Host-Neustart muss manuell verifiziert werden.
 
 ## Projektstruktur
 
@@ -301,7 +308,7 @@ In dieser Umgebung wurde **kein echter Proxmox-Host** ausgeführt. Validiert wur
 - nginx 1.24 mit dem gerenderten Template lokal: Syntax, Basic-Auth auf `/` und `/tolaria-config.js`, kein Basic-Auth auf `/v1/`, Bearer-Passthrough, gzip/Asset-Caching und öffentliches `/healthz` als Proxy zum Server
 - systemd-Unit (soweit ohne `tolaria`-User/Pfade auf dem Testhost möglich)
 - Installer `--dry-run`, `--help` und Secret-Redaction
-- DNS-Reparatur (`scripts/repair-dns.sh`): Rendering der `resolv.conf`, Validierung von Nameservern, Ablehnung ungültiger Eingaben, Fallback-Nameserver und Backup/Restore
+- DNS-Reparatur (`scripts/repair-dns.sh`): Rendering der `resolv.conf`, Validierung von Nameservern, Ablehnung ungültiger Eingaben, Fallback-Nameserver, Backup/Restore, IPv4/A-Record-Prüfung und idempotentes Festschreiben gegen DHCP (`supersede`)
 - Persistenz der tatsächlich funktionierenden Nameserver in der CT-Config (statisch geprüft)
 - Statische Prüfung, dass apt-Fehler nicht mehr ignoriert werden (`Failed to fetch`-Erkennung, Retries)
 - Statische Prüfung des inkrementellen Updates (`FORCE_BUILD`, Build-Skip)

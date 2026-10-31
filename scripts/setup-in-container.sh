@@ -48,9 +48,13 @@ on_error() {
   echo ""
   msg_error "--- DNS / Netzwerk ---"
   cat /etc/resolv.conf 2>&1 || true
-  getent hosts deb.debian.org 2>&1 || echo "DNS-Auflösung fehlgeschlagen"
+  getent ahostsv4 deb.debian.org 2>&1 || echo "IPv4-Auflösung fehlgeschlagen"
+  getent ahostsv6 deb.debian.org 2>&1 || echo "IPv6-Auflösung fehlgeschlagen"
   ip -4 route 2>&1 || true
   ip -4 addr show dev eth0 2>&1 || true
+  if [[ -f /etc/dhcp/dhclient.conf ]]; then
+    grep -n 'tolaria-dns\|domain-name-servers' /etc/dhcp/dhclient.conf 2>&1 || true
+  fi
   echo ""
   msg_error "--- nginx -t ---"
   nginx -t 2>&1 || true
@@ -114,6 +118,12 @@ APT_PACKAGES=(
 APT_OPTS=(-o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
 APT_LOG="/root/tolaria-apt-update.log"
 
+# In einem Container ohne globales IPv6 wartet apt sonst lange auf AAAA-
+# Verbindungen. deb.debian.org ist dual-stack; IPv4 reicht hier.
+if command -v ip >/dev/null 2>&1 && ! ip -6 addr show scope global 2>/dev/null | grep -q 'inet6 '; then
+  APT_OPTS+=(-o Acquire::ForceIPv4=true)
+fi
+
 retry() {
   local attempts="$1" delay="$2"; shift 2
   local i
@@ -133,25 +143,43 @@ msg_info "Setup für ${APP} (Web-Port ${PORT}, Server 127.0.0.1:${SERVER_PORT})"
 msg_info "Build-Log: ${BUILD_LOG}"
 
 # ---------------------------------------------------------------------------
-# DNS prüfen (der Host-Installer hat das meist schon erledigt; hier als Guard,
-# falls das Setup direkt oder nach einem CT-Reboot erneut läuft)
+# DNS prüfen und gegen DHCP-Überschreiben absichern
 # ---------------------------------------------------------------------------
-msg_info "Prüfe DNS-Auflösung ..."
-if [[ -f "${PKG_DIR}/repair-dns.sh" ]]; then
-  if ! bash "${PKG_DIR}/repair-dns.sh" --servers "$TOLARIA_DNS_SERVERS"; then
-    msg_error "DNS-Auflösung funktioniert nicht - apt-get würde mit"
-    msg_error "\"Temporary failure resolving ...\" scheitern."
-    msg_error "Auf dem Proxmox-Host:"
-    msg_error "  pct set ${CTID} --nameserver \"${TOLARIA_DNS_SERVERS}\""
-    msg_error "  pct reboot ${CTID}"
-    msg_error "Danach den Installer erneut ausführen."
-    exit 1
+REPAIR_DNS="${PKG_DIR}/repair-dns.sh"
+
+dns_guard() {
+  if [[ -f "$REPAIR_DNS" ]]; then
+    bash "$REPAIR_DNS" --servers "$TOLARIA_DNS_SERVERS" --persist-dhclient
+  else
+    getent ahostsv4 deb.debian.org >/dev/null 2>&1
   fi
-elif ! getent hosts deb.debian.org >/dev/null 2>&1; then
-  msg_error "DNS-Auflösung fehlgeschlagen und ${PKG_DIR}/repair-dns.sh fehlt."
-  cat /etc/resolv.conf 2>/dev/null || true
+}
+
+msg_info "Prüfe DNS-Auflösung (IPv4/A-Records, apt) ..."
+if ! dns_guard; then
+  msg_error "DNS-Auflösung funktioniert nicht - apt-get würde mit"
+  msg_error "\"Temporary failure resolving ...\" scheitern."
+  msg_error "Prüfe besonders die IPv4-Auflösung:"
+  msg_error "  getent ahostsv4 deb.debian.org"
+  msg_error "  cat /etc/resolv.conf"
+  msg_error "Wichtig: apt braucht IPv4/A-Records - reine AAAA-Antworten genügen nicht."
+  msg_error "Auf dem Proxmox-Host:"
+  msg_error "  pct set ${CTID} --nameserver \"${TOLARIA_DNS_SERVERS}\""
+  msg_error "  pct reboot ${CTID}"
+  msg_error "Funktionierenden Resolver ggf. erzwingen: --dns \"<IP>\""
+  msg_error "Danach den Installer erneut ausführen."
   exit 1
 fi
+
+# repair-dns.sh kann auf den öffentlichen Fallback ausgewichen sein. Die
+# tatsächlich aktiven Nameserver werden deshalb aus /etc/resolv.conf gelesen
+# und für dhclient festgeschrieben (--persist-dhclient im Aufruf oben).
+EFFECTIVE_DNS="$(awk '/^nameserver[[:space:]]/ {printf "%s ", $2}' /etc/resolv.conf 2>/dev/null \
+  | sed 's/[[:space:]]*$//')"
+if [[ -z "$EFFECTIVE_DNS" ]]; then
+  EFFECTIVE_DNS="$TOLARIA_DNS_SERVERS"
+fi
+TOLARIA_DNS_SERVERS="$EFFECTIVE_DNS"
 
 # ---------------------------------------------------------------------------
 # Pakete
@@ -166,6 +194,8 @@ if ! retry 3 5 apt-get update "${APT_OPTS[@]}" >"$APT_LOG" 2>&1; then
   cat "$APT_LOG"
   msg_error "apt-get update ist fehlgeschlagen (DNS, Proxy oder Mirror-Problem)."
   msg_error "Nameserver: ${TOLARIA_DNS_SERVERS}"
+  msg_error "IPv4/A: $(getent ahostsv4 deb.debian.org 2>&1 | awk 'NR<=2 {print $1}' | paste -sd' ' - || true)"
+  msg_error "IPv6/AAAA: $(getent ahostsv6 deb.debian.org 2>&1 | awk 'NR<=2 {print $1}' | paste -sd' ' - || true)"
   cat /etc/resolv.conf 2>/dev/null || true
   exit 1
 fi
@@ -182,12 +212,47 @@ if grep -qE 'Failed to fetch|Temporary failure resolving|Could not resolve' "$AP
   fi
 fi
 
-if ! retry 3 10 apt-get install -y --no-install-recommends "${APT_OPTS[@]}" "${APT_PACKAGES[@]}"; then
-  msg_error "Systempakete konnten nicht installiert werden."
-  msg_error "Häufigste Ursache: DNS/Internet/Proxy im Container (siehe ${APT_LOG})."
-  exit 1
+# Vor dem Download erneut prüfen: ein DHCP-Lease oder ein flakiger Resolver
+# kann die Auflösung zwischen Update und Install wieder kaputt machen.
+apt_install_packages() {
+  apt-get install -y --no-install-recommends "${APT_OPTS[@]}" "${APT_PACKAGES[@]}"
+}
+
+if ! getent ahostsv4 deb.debian.org >/dev/null 2>&1; then
+  msg_warn "IPv4-Auflösung vor dem Paketdownload gestört - repariere erneut ..."
+  if ! dns_guard; then
+    msg_error "DNS-Reparatur vor dem Paketdownload fehlgeschlagen."
+    cat /etc/resolv.conf 2>/dev/null || true
+    exit 1
+  fi
+fi
+
+if ! retry 3 10 apt_install_packages; then
+  msg_warn "Erster Installationsversuch fehlgeschlagen - aktualisiere Listen und versuche es mit --fix-missing erneut ..."
+  retry 2 10 apt-get update "${APT_OPTS[@]}" >>"$APT_LOG" 2>&1 || msg_warn "apt-get update beim zweiten Versuch fehlgeschlagen."
+  if ! apt-get install -y --no-install-recommends --fix-missing "${APT_OPTS[@]}" "${APT_PACKAGES[@]}"; then
+    msg_error "Systempakete konnten nicht installiert werden."
+    msg_error "Nameserver: ${TOLARIA_DNS_SERVERS}"
+    msg_error "IPv4/A: $(getent ahostsv4 deb.debian.org 2>&1 | awk 'NR<=2 {print $1}' | paste -sd' ' - || true)"
+    msg_error "IPv6/AAAA: $(getent ahostsv6 deb.debian.org 2>&1 | awk 'NR<=2 {print $1}' | paste -sd' ' - || true)"
+    cat /etc/resolv.conf 2>/dev/null || true
+    msg_error "Häufigste Ursache: DNS/Internet/Proxy im Container (siehe ${APT_LOG})."
+    exit 1
+  fi
 fi
 msg_ok "Systempakete installiert."
+
+# --fix-missing kann fehlende Pakete stillschweigend überspringen. Deshalb
+# wird explizit geprüft, dass die später benötigten Werkzeuge da sind.
+missing_cmds=()
+for cmd in nginx git htpasswd curl openssl python3 gpg make; do
+  command -v "$cmd" >/dev/null 2>&1 || missing_cmds+=("$cmd")
+done
+if (( ${#missing_cmds[@]} > 0 )); then
+  msg_error "Nach der Paketinstallation fehlen: ${missing_cmds[*]}"
+  msg_error "Erneut ausführen oder im Container manuell nachinstallieren."
+  exit 1
+fi
 
 # ---------------------------------------------------------------------------
 # Node 22.14+ und pnpm 10.33.0
