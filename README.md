@@ -276,6 +276,18 @@ DNS_SERVERS="192.168.1.1" bash /tmp/tolaria.sh
 
 `pct set --nameserver` ist wichtig: Ohne den Eintrag in der CT-Config schreibt Proxmox die kaputte Datei beim nächsten Start wieder. Der Installer ist idempotent: Bei einem vorhandenen Container genügt ein erneuter Lauf, er repariert DNS und den DHCP-Schutz automatisch.
 
+### Node.js bleibt bei Version 18 / NodeSource scheitert
+
+NodeSource läuft über apt und HTTPS. In Containern mit unvollständigem CA-Bundle, altem Debian-Keyring oder einer apt-HTTPS-Macke scheitert das Repo, und apt installiert das Debian-Node 18. Der Installer versucht NodeSource, prüft danach die Version und installiert bei Bedarf den **offiziellen Node-22-Tarball** von `nodejs.org` nach `/usr/local` (SHA256-geprüft, ohne apt/GPG). Die systemd-Unit wird dabei automatisch auf den tatsächlichen Node-Pfad umgeschrieben.
+
+Prüfen:
+
+```bash
+pct exec <CTID> -- node --version
+pct exec <CTID> -- systemctl cat tolaria | grep ExecStart
+pct exec <CTID> -- ls -l /usr/local/bin/node
+```
+
 ### Build schlägt fehl / OOM
 
 Der TypeScript-/Vite-Build braucht RAM. Mindestens 6 GB, besser 8 GB:
@@ -384,6 +396,7 @@ In dieser Umgebung wurde **kein echter Proxmox-Host** ausgeführt. Validiert wur
 - apt-Grundeinstellungen im Container: `ForceIPv4`, Retries, Timeouts und `Queue-Mode access`
 - Lokaler apt-Proxy (`scripts/apt-proxy.pl`): HTTP-Weiterleitung über Host-Mapping funktional getestet, inklusive HTTPS-`CONNECT` (manuell mit lokalem TLS-Server und echtem apt-Update)
 - CA-/Keyring-Reparatur vor NodeSource (`ca-certificates`, `debian-archive-keyring`, `update-ca-certificates --fresh`)
+- Offizieller Node-22-Tarball als Fallback (SHA256-geprüft, nach `/usr/local`, systemd-Unit nutzt den tatsächlichen Pfad): Download und Extraktion funktional getestet
 - Verifikation des Pins über `getent ahostsv4` plus `/etc/hosts`-Abgleich; apt versucht bei Fehlern zuerst erneut mit Pin und entfernt ihn erst für den letzten DNS-Versuch
 - Packaging als atomarer Tarball inkl. Cache-Buster und Raw-Fallback: lokaler Tarball, `file://`-Tarball und echter `codeload.github.com`-Download getestet
 - Persistenz der tatsächlich funktionierenden Nameserver in der CT-Config (statisch geprüft); wird jetzt auch bei bereits funktionierendem DNS geschrieben

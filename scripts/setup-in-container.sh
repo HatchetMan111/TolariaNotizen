@@ -6,6 +6,9 @@
 set -euo pipefail
 set +x
 umask 077
+# Ein per Tarball installiertes Node liegt unter /usr/local/bin und muss bei
+# einem erneuten Lauf vor /usr/bin/node gefunden werden.
+export PATH="/usr/local/bin:/usr/local/sbin:${PATH}"
 
 APP="tolaria"
 BUILD_LOG="/root/tolaria-build.log"
@@ -664,6 +667,71 @@ fi
 # ---------------------------------------------------------------------------
 # Node 22.14+ und pnpm 10.33.0
 # ---------------------------------------------------------------------------
+# NodeSource ist der bevorzugte Weg, aber apts HTTPS-Methode kann in
+# Containern an CA-/GPG-Problemen scheitern. Der offizielle Node-Tarball
+# umgeht apt vollständig; curl prüft das Zertifikat gegen das CA-Bundle.
+install_node_tarball() {
+  local prefix="${NODE_PREFIX:-/usr/local}"
+  local base="https://nodejs.org/dist/latest-v22.x"
+  local sums="/tmp/tolaria-node-SHASUMS256.txt"
+  local file ip
+  local -a curl_opts=()
+
+  command -v curl >/dev/null 2>&1 || { msg_error "curl fehlt für den Node-Tarball."; return 1; }
+  command -v tar >/dev/null 2>&1 || { msg_error "tar fehlt für den Node-Tarball."; return 1; }
+  command -v sha256sum >/dev/null 2>&1 || { msg_error "sha256sum fehlt."; return 1; }
+
+  # nodejs.org per IPv4 pinnen, damit auch dieser Download kein DNS braucht.
+  ip="$(getent ahostsv4 nodejs.org 2>/dev/null | awk 'NR==1 {print $1}')"
+  if [[ -z "$ip" ]]; then
+    msg_error "nodejs.org ist nicht per IPv4 auflösbar."
+    return 1
+  fi
+  curl_opts=(--resolve "nodejs.org:443:${ip}")
+
+  download_node_file() {
+    local url="$1" out="$2" max_time="$3"
+    if retry 3 5 curl -fsSL --max-time "$max_time" \
+         "${curl_opts[@]}" "$url" -o "$out"; then
+      return 0
+    fi
+    msg_warn "Download über die gepinnte IP fehlgeschlagen - versuche normalen DNS-Weg."
+    retry 3 5 curl -fsSL --max-time "$max_time" "$url" -o "$out"
+  }
+
+  msg_info "Lade Node.js-22-Tarball von nodejs.org (${ip}) ..."
+  if ! download_node_file "${base}/SHASUMS256.txt" "$sums" 60; then
+    msg_error "SHASUMS256.txt konnte nicht geladen werden."
+    return 1
+  fi
+  file="$(awk '$2 ~ /^node-v[0-9]+\.[0-9]+\.[0-9]+-linux-x64\.tar\.gz$/ {print $2}' "$sums" | tail -n1)"
+  if [[ -z "$file" ]]; then
+    msg_error "Kein linux-x64-Tarball in SHASUMS256.txt gefunden."
+    return 1
+  fi
+  if ! download_node_file "${base}/${file}" "/tmp/${file}" 300; then
+    msg_error "Node-Tarball konnte nicht geladen werden: ${file}"
+    return 1
+  fi
+  if ! (cd /tmp && awk -v f="$file" '$2 == f' "$sums" | sha256sum -c -); then
+    msg_error "SHA256-Prüfung des Node-Tarballs fehlgeschlagen."
+    rm -f "/tmp/${file}" "$sums"
+    return 1
+  fi
+
+  mkdir -p "$prefix"
+  if ! tar -xzf "/tmp/${file}" -C "$prefix" --strip-components=1 --no-same-owner; then
+    msg_error "Node-Tarball konnte nicht entpackt werden."
+    rm -f "/tmp/${file}" "$sums"
+    return 1
+  fi
+  rm -f "/tmp/${file}" "$sums"
+  export PATH="${prefix}/bin:${PATH}"
+  hash -r
+  command -v node >/dev/null 2>&1 || { msg_error "node nach Tarball-Installation nicht gefunden."; return 1; }
+  msg_ok "Node.js $(node --version) aus Tarball installiert (${prefix})."
+}
+
 need_node=0
 if ! command -v node >/dev/null 2>&1; then
   need_node=1
@@ -689,28 +757,34 @@ if [[ "$need_node" == "1" ]]; then
     export https_proxy="$http_proxy"
     export no_proxy="localhost,127.0.0.1"
   fi
-  if ! retry 3 5 curl -fsSL --max-time 60 https://deb.nodesource.com/setup_22.x -o /tmp/nodesource_setup.sh; then
-    msg_error "NodeSource-Setup konnte nicht geladen werden (https://deb.nodesource.com)."
-    msg_error "Prüfe DNS/Internet/Proxy im Container."
-    exit 1
+  if retry 3 5 curl -fsSL --max-time 60 https://deb.nodesource.com/setup_22.x -o /tmp/nodesource_setup.sh; then
+    bash /tmp/nodesource_setup.sh
+    rm -f /tmp/nodesource_setup.sh
+    if ! retry 3 10 apt-get install -y "${APT_OPTS[@]}" nodejs; then
+      msg_warn "NodeSource-apt-Installation fehlgeschlagen - versuche den offiziellen Tarball."
+    fi
+  else
+    msg_warn "NodeSource-Setup konnte nicht geladen werden - versuche den offiziellen Tarball."
   fi
-  bash /tmp/nodesource_setup.sh
-  rm -f /tmp/nodesource_setup.sh
   unset http_proxy https_proxy no_proxy
-  if ! retry 3 10 apt-get install -y "${APT_OPTS[@]}" nodejs; then
-    msg_error "Node.js konnte nicht installiert werden."
-    exit 1
-  fi
   unpin_apt_hosts
 else
   msg_ok "Node.js $(node --version) bereits vorhanden."
 fi
 
-node_major="$(node -p 'process.versions.node.split(".")[0]')"
-node_minor="$(node -p 'process.versions.node.split(".")[1]')"
+# Falls NodeSource nur das alte Debian-Node geliefert hat: offiziellen
+# Node-22-Tarball installieren. Das ist unabhängig von apt/GPG/HTTPS-apt.
+node_major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
+node_minor="$(node -p 'process.versions.node.split(".")[1]' 2>/dev/null || echo 0)"
 if (( node_major < 22 || (node_major == 22 && node_minor < 14) )); then
-  msg_error "Node.js $(node --version) ist zu alt. Tolaria braucht >= 22.14."
-  exit 1
+  msg_warn "Node.js $(node --version 2>/dev/null || echo '<fehlt>') ist zu alt - installiere den offiziellen Node-22-Tarball."
+  install_node_tarball || { msg_error "Node.js 22.14+ konnte nicht installiert werden."; exit 1; }
+  node_major="$(node -p 'process.versions.node.split(".")[0]')"
+  node_minor="$(node -p 'process.versions.node.split(".")[1]')"
+  if (( node_major < 22 || (node_major == 22 && node_minor < 14) )); then
+    msg_error "Node.js $(node --version) ist weiterhin zu alt."
+    exit 1
+  fi
 fi
 msg_ok "Node.js $(node --version)"
 
@@ -809,6 +883,7 @@ if [[ "$NEED_BUILD" == "1" ]]; then
   msg_info "Installiere pnpm-Abhängigkeiten (kann einige Minuten dauern) ..."
   if ! runuser -u "$APP" -- env \
     HOME="/home/$APP" \
+    PATH="/usr/local/bin:/usr/bin:/bin" \
     HUSKY=0 \
     CI=1 \
     NODE_OPTIONS="--max-old-space-size=4096" \
@@ -820,6 +895,7 @@ if [[ "$NEED_BUILD" == "1" ]]; then
   msg_info "Baue Tolaria Web (tsc + vite) ..."
   if ! runuser -u "$APP" -- env \
     HOME="/home/$APP" \
+    PATH="/usr/local/bin:/usr/bin:/bin" \
     CI=1 \
     NODE_OPTIONS="--max-old-space-size=4096" \
     bash -lc 'cd /opt/tolaria/src && pnpm build:web'; then
@@ -877,7 +953,14 @@ PY
 chown root:www-data /etc/tolaria/tolaria-config.js
 chmod 640 /etc/tolaria/tolaria-config.js
 
-install -m 644 -o root -g root "${PKG_DIR}/tolaria.service" /etc/systemd/system/tolaria.service
+NODE_BIN="$(command -v node || true)"
+[[ -n "$NODE_BIN" ]] || { msg_error "node ist nicht im PATH - systemd-Unit kann nicht geschrieben werden."; exit 1; }
+# Bei einer Tarball-Installation liegt node unter /usr/local/bin/node, nicht
+# unter /usr/bin/node. Die Unit muss deshalb den tatsächlichen Pfad nutzen.
+sed "s|^ExecStart=/usr/bin/node|ExecStart=${NODE_BIN}|" \
+  "${PKG_DIR}/tolaria.service" > /etc/systemd/system/tolaria.service
+chown root:root /etc/systemd/system/tolaria.service
+chmod 644 /etc/systemd/system/tolaria.service
 systemctl daemon-reload
 systemctl enable tolaria >/dev/null 2>&1
 msg_ok "systemd-Unit installiert und aktiviert."
