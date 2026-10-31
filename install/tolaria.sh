@@ -23,6 +23,7 @@ umask 077
 # ---------------------------------------------------------------------------
 APP="tolaria"
 APP_TITLE="Tolaria"
+INSTALLER_VERSION="2026-10-31.5"
 PORT="${PORT:-8080}"                            # nginx / Web-UI
 SERVER_PORT="8787"                              # Tolaria-Server, nur 127.0.0.1
 UPSTREAM_REPO="https://github.com/refactoringhq/tolaria.git"
@@ -319,6 +320,7 @@ ${APP_TITLE} - Dry Run (es wird nichts verändert)
   Basic-Auth-User  : ${AUTH_USER}
   Build erzwingen  : ${FORCE_BUILD}
   Installer-Repo   : ${INSTALLER_RAW}
+  Installer-Version: ${INSTALLER_VERSION}
   Packaging        : ${PACKAGING_TARBALL:-Tarball ${INSTALLER_REPO_SLUG} @ ${PACKAGING_REF}}
 
 Ablauf:
@@ -340,6 +342,7 @@ fi
 # Log ab hier mitschreiben (vollständige Kette)
 exec > >(tee -i "$LOG_FILE") 2>&1
 chmod 600 "$LOG_FILE" 2>/dev/null || true
+msg_info "Installer-Version: ${INSTALLER_VERSION}"
 msg_info "Logdatei: $LOG_FILE"
 msg_info "Container-Nameserver: ${CT_DNS}"
 if [[ "$DEBUG" == "1" ]]; then
@@ -613,6 +616,22 @@ for rel in "scripts/setup-in-container.sh" "scripts/repair-dns.sh"; do
 done
 bash -n "$PKG_DIR/setup-in-container.sh" \
   || { msg_error "Packaging fehlerhaft: setup-in-container.sh hat einen Syntaxfehler."; exit 1; }
+
+# Versions-Handshake: Host-Skript und Container-Setup müssen aus demselben
+# Stand kommen. Sonst läuft z. B. ein neues Setup mit alten Erwartungen (oder
+# umgekehrt), und Fehlermeldungen beziehen sich auf Code, der gar nicht aktiv ist.
+setup_version="$(sed -n 's/^SETUP_VERSION="\([^"]*\)"$/\1/p' "$PKG_DIR/setup-in-container.sh" | head -n1)"
+if [[ -z "$setup_version" ]]; then
+  msg_error "Packaging ist zu alt (kein SETUP_VERSION-Marker)."
+  msg_error "Bitte den Einzeiler mit '?cb=\$(date +%s)' neu laden."
+  exit 1
+fi
+if [[ "$setup_version" != "$INSTALLER_VERSION" ]]; then
+  msg_error "Versionskonflikt: Host-Skript ${INSTALLER_VERSION}, Packaging ${setup_version}."
+  msg_error "Das ist meist ein CDN-Cache. Bitte den Einzeiler mit '?cb=\$(date +%s)' neu laden."
+  exit 1
+fi
+msg_ok "Versionen passen: Installer/Packaging ${INSTALLER_VERSION}."
 
 # ---------------------------------------------------------------------------
 # Container erstellen (idempotent: existiert die CT-ID, wiederverwenden)

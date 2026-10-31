@@ -203,6 +203,10 @@ Symptom: Ein Fix ist auf `main`, aber der Lauf zeigt weiterhin das alte Verhalte
 
 Ursache ist der GitHub-CDN: `raw.githubusercontent.com` cached `main` typischerweise einige Minuten. Das Installer-Skript und die einzeln nachgeladenen Packaging-Dateien können dadurch aus **unterschiedlichen Commits** stammen. Der Installer lädt Packaging deshalb inzwischen bevorzugt als **einen Tarball** (`codeload.github.com/.../tar.gz/refs/heads/main`), also als konsistenten Snapshot. Zusätzlich ist das apt-Host-Pinning im Container-Skript selbst eingebaut, falls `apt-hosts-pin.sh` durch ein altes Host-Skript nicht mitgepusht wurde.
 
+Host-Skript und Container-Setup tragen eine gemeinsame `INSTALLER_VERSION`/`SETUP_VERSION`. Weichen sie voneinander ab, bricht der Installer **vor** dem Containerstart mit einer klaren Meldung ab, statt einen halb kompatiblen Lauf zu starten. Der erste Log-Eintrag im Container ist `Setup-Version: ...`; damit lässt sich ein alter Lauf sofort erkennen.
+
+Trotzdem gilt: Nach einem Push den Einzeiler mit Cache-Buster verwenden:
+
 Trotzdem gilt: Nach einem Push den Einzeiler mit Cache-Buster verwenden:
 
 ```bash

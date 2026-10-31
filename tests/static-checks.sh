@@ -623,6 +623,9 @@ run "Setup: FORCE_BUILD" grep -q 'FORCE_BUILD' "$CT_SETUP"
 run "README: Troubleshooting DNS" grep -q "Temporary failure resolving" "$REPO_ROOT/README.md"
 run "README: Troubleshooting CDN-Cache" grep -q 'GitHub-CDN' "$REPO_ROOT/README.md"
 run "README: Einzeiler mit Cache-Buster" grep -q 'cb=$(date +%s)' "$REPO_ROOT/README.md"
+run "Host: Versionsmarker" grep -q '^INSTALLER_VERSION=' "$REPO_ROOT/install/tolaria.sh"
+run "Setup: Versionsmarker" grep -q '^SETUP_VERSION=' "$REPO_ROOT/scripts/setup-in-container.sh"
+run "Host: Versions-Handshake" grep -q 'setup_version' "$REPO_ROOT/install/tolaria.sh"
 
 echo ""
 echo "== Installer-Dry-Run / Hilfe =="
@@ -632,6 +635,7 @@ DRY="$(bash "$REPO_ROOT/install/tolaria.sh" --dry-run --ctid 150 2>&1)"
 if grep -q 'CT-ID            : 150' <<<"$DRY"; then pass "Dry-Run zeigt CT-ID"; else fail "Dry-Run zeigt CT-ID"; fi
 if grep -q '10-25 Minuten' <<<"$DRY"; then pass "Dry-Run nennt Build-Dauer"; else fail "Dry-Run nennt Build-Dauer"; fi
 if grep -q 'Nameserver (CT)' <<<"$DRY"; then pass "Dry-Run zeigt Nameserver"; else fail "Dry-Run zeigt Nameserver"; fi
+if grep -q 'Installer-Version' <<<"$DRY"; then pass "Dry-Run zeigt Installer-Version"; else fail "Dry-Run zeigt Installer-Version"; fi
 if grep -q 'Build erzwingen' <<<"$DRY"; then pass "Dry-Run zeigt Force-Build"; else fail "Dry-Run zeigt Force-Build"; fi
 if bash "$REPO_ROOT/install/tolaria.sh" --help 2>&1 | grep -q -- '--force-build'; then
   pass "--help nennt --force-build"

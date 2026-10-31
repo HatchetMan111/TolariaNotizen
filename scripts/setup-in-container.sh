@@ -11,6 +11,7 @@ umask 077
 export PATH="/usr/local/bin:/usr/local/sbin:${PATH}"
 
 APP="tolaria"
+SETUP_VERSION="2026-10-31.5"
 BUILD_LOG="/root/tolaria-build.log"
 PKG_DIR="/root/tolaria-packaging"
 INSTALL_ENV="${PKG_DIR}/install.env"
@@ -163,6 +164,7 @@ retry() {
 }
 
 msg_info "Setup für ${APP} (Web-Port ${PORT}, Server 127.0.0.1:${SERVER_PORT})"
+msg_info "Setup-Version: ${SETUP_VERSION}"
 msg_info "Build-Log: ${BUILD_LOG}"
 
 # ---------------------------------------------------------------------------
@@ -758,10 +760,14 @@ if [[ "$need_node" == "1" ]]; then
     export no_proxy="localhost,127.0.0.1"
   fi
   if retry 3 5 curl -fsSL --max-time 60 https://deb.nodesource.com/setup_22.x -o /tmp/nodesource_setup.sh; then
-    bash /tmp/nodesource_setup.sh
-    rm -f /tmp/nodesource_setup.sh
-    if ! retry 3 10 apt-get install -y "${APT_OPTS[@]}" nodejs; then
-      msg_warn "NodeSource-apt-Installation fehlgeschlagen - versuche den offiziellen Tarball."
+    if bash /tmp/nodesource_setup.sh; then
+      rm -f /tmp/nodesource_setup.sh
+      if ! retry 3 10 apt-get install -y "${APT_OPTS[@]}" nodejs; then
+        msg_warn "NodeSource-apt-Installation fehlgeschlagen - versuche den offiziellen Tarball."
+      fi
+    else
+      rm -f /tmp/nodesource_setup.sh
+      msg_warn "NodeSource-Setup ist fehlgeschlagen - versuche den offiziellen Tarball."
     fi
   else
     msg_warn "NodeSource-Setup konnte nicht geladen werden - versuche den offiziellen Tarball."
