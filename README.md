@@ -280,9 +280,11 @@ DNS_SERVERS="192.168.1.1" bash /tmp/tolaria.sh
 
 `pct set --nameserver` ist wichtig: Ohne den Eintrag in der CT-Config schreibt Proxmox die kaputte Datei beim nächsten Start wieder. Der Installer ist idempotent: Bei einem vorhandenen Container genügt ein erneuter Lauf, er repariert DNS und den DHCP-Schutz automatisch.
 
-### `pnpm: command not found` / `/etc/profile: Permission denied`
+### `pnpm: command not found` / `Permission denied`
 
 Die Build-Schritte liefen früher über `bash -lc`. Eine Login-Shell liest `/etc/profile`; ist die Datei für den `tolaria`-User nicht lesbar, bricht die Profilauswertung ab und der `PATH` geht verloren. Der Installer setzt `/etc/profile` deshalb auf 644, ruft `pnpm` über den absolut ermittelten Pfad auf und nutzt `bash -c` mit explizitem `PATH` statt einer Login-Shell.
+
+Zusätzlich erbt `npm install -g` das restriktive `umask 077` des Setups und legt `pnpm` als `root:root` mit Modus 600 an. Der Build läuft aber als `tolaria` und bekommt dann `Permission denied`. Der Installer installiert pnpm deshalb mit `umask 022` und setzt die Rechte auf der pnpm-Installation anschließend explizit auf lesbar/ausführbar.
 
 ### `fatal: not in a git directory` beim Vault-Seeding
 

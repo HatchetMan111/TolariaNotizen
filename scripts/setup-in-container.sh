@@ -11,7 +11,7 @@ umask 077
 export PATH="/usr/local/bin:/usr/local/sbin:${PATH}"
 
 APP="tolaria"
-SETUP_VERSION="2026-10-31.8"
+SETUP_VERSION="2026-10-31.9"
 BUILD_LOG="/root/tolaria-build.log"
 PKG_DIR="/root/tolaria-packaging"
 INSTALL_ENV="${PKG_DIR}/install.env"
@@ -801,7 +801,9 @@ if ! command -v npm >/dev/null 2>&1; then
   exit 1
 fi
 msg_info "Installiere pnpm 10.33.0 global ..."
-if ! retry 3 10 npm install -g --no-fund --no-audit pnpm@10.33.0; then
+# Das globale npm erbt sonst das umask 077 des Setups und legt pnpm als
+# root:root 600 an. Der Build läuft als tolaria und darf pnpm nicht ausführen.
+if ! retry 3 10 bash -c 'umask 022; npm install -g --no-fund --no-audit pnpm@10.33.0'; then
   msg_error "pnpm konnte nicht über npm installiert werden (Registry erreichbar?)."
   exit 1
 fi
@@ -809,6 +811,19 @@ pnpm_version="$(pnpm --version)"
 [[ "$pnpm_version" == "10.33.0" ]] || { msg_error "pnpm-Version ist ${pnpm_version}, erwartet 10.33.0"; exit 1; }
 PNPM_BIN="$(command -v pnpm || true)"
 [[ -n "$PNPM_BIN" ]] || { msg_error "pnpm ist nach der Installation nicht im PATH."; exit 1; }
+PNPM_REAL="$(readlink -f "$PNPM_BIN" 2>/dev/null || true)"
+if [[ -n "$PNPM_REAL" && -f "$PNPM_REAL" ]]; then
+  chmod 755 "$PNPM_REAL" 2>/dev/null || true
+fi
+PNPM_ROOT="$(npm root -g 2>/dev/null || true)"
+if [[ -n "$PNPM_ROOT" && -d "$PNPM_ROOT/pnpm" ]]; then
+  chmod -R a+rX "$PNPM_ROOT/pnpm" 2>/dev/null || true
+fi
+chmod 755 /usr/local/bin/node /usr/local/bin/npm /usr/local/bin/npx 2>/dev/null || true
+if [[ ! -x "$PNPM_BIN" ]]; then
+  msg_error "pnpm ist für andere Benutzer nicht ausführbar: ${PNPM_BIN}"
+  exit 1
+fi
 msg_ok "pnpm ${pnpm_version} (${PNPM_BIN})"
 
 # Ein restriktives /etc/profile darf keinen Login-Shell-Build verhindern.
