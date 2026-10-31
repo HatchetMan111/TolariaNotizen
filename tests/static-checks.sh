@@ -599,6 +599,8 @@ run "Setup: pnpm mit umask 022 installiert" grep -q 'umask 022; npm install -g' 
 run "Setup: pnpm-Rechte werden korrigiert" grep -q 'chmod -R a+rX' "$CT_SETUP"
 run "Setup: globales umask 022" grep -q '^umask 022$' "$CT_SETUP"
 run "Setup: openssl.cnf wird lesbar gemacht" grep -q 'chmod 644 /etc/ssl/openssl.cnf' "$CT_SETUP"
+run "Setup: Build nutzt OPENSSL_CONF" grep -q 'OPENSSL_CONF=/dev/null' "$CT_SETUP"
+run "Setup: Pfadrechte werden diagnostiziert" grep -q 'namei -l /etc/ssl/openssl.cnf' "$CT_SETUP"
 run "Setup: Build ohne Login-Shell" grep -q 'bash -c "cd /opt/tolaria/src' "$CT_SETUP"
 run "Setup: systemd nutzt tatsächlichen node-Pfad" grep -q 'ExecStart=${NODE_BIN}' "$CT_SETUP"
 run "Host: Packaging als atomarer Tarball" grep -q 'codeload.github.com' "$HOST_INST"

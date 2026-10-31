@@ -14,7 +14,7 @@ umask 022
 export PATH="/usr/local/bin:/usr/local/sbin:${PATH}"
 
 APP="tolaria"
-SETUP_VERSION="2026-10-31.10"
+SETUP_VERSION="2026-10-31.11"
 BUILD_LOG="/root/tolaria-build.log"
 PKG_DIR="/root/tolaria-packaging"
 INSTALL_ENV="${PKG_DIR}/install.env"
@@ -668,7 +668,9 @@ fi
 # früheren Laufs kann die Datei auf 600 gesetzt haben; tolaria darf sie lesen.
 chmod 755 /etc/ssl 2>/dev/null || true
 chmod 755 /etc/ssl/certs 2>/dev/null || true
+chmod 755 /usr/lib/ssl 2>/dev/null || true
 chmod 644 /etc/ssl/openssl.cnf 2>/dev/null || true
+chmod 644 /usr/lib/ssl/openssl.cnf 2>/dev/null || true
 chmod 644 /etc/ssl/certs/ca-certificates.crt 2>/dev/null || true
 if retry 2 5 apt_update_once; then
   msg_ok "Paketlisten nach Keyring-Update aktualisiert."
@@ -918,10 +920,18 @@ if [[ "$NEED_BUILD" == "1" ]]; then
     exit 1
   fi
 
+  if ! runuser -u "$APP" -- test -r /etc/ssl/openssl.cnf 2>/dev/null; then
+    msg_warn "tolaria kann /etc/ssl/openssl.cnf nicht lesen - Build nutzt OPENSSL_CONF=/dev/null."
+    ls -ld /etc /etc/ssl 2>&1 | sed 's/^/  /' || true
+    ls -l /etc/ssl/openssl.cnf 2>&1 | sed 's/^/  /' || true
+    namei -l /etc/ssl/openssl.cnf 2>&1 | sed 's/^/  /' || true
+  fi
+
   msg_info "Installiere pnpm-Abhängigkeiten (kann einige Minuten dauern) ..."
   if ! runuser -u "$APP" -- env \
     HOME="/home/$APP" \
     PATH="/usr/local/bin:/usr/bin:/bin" \
+    OPENSSL_CONF=/dev/null \
     HUSKY=0 \
     CI=1 \
     NODE_OPTIONS="--max-old-space-size=4096" \
@@ -934,6 +944,7 @@ if [[ "$NEED_BUILD" == "1" ]]; then
   if ! runuser -u "$APP" -- env \
     HOME="/home/$APP" \
     PATH="/usr/local/bin:/usr/bin:/bin" \
+    OPENSSL_CONF=/dev/null \
     CI=1 \
     NODE_OPTIONS="--max-old-space-size=4096" \
     bash -c "cd /opt/tolaria/src && '${PNPM_BIN}' build:web"; then

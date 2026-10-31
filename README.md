@@ -284,7 +284,7 @@ DNS_SERVERS="192.168.1.1" bash /tmp/tolaria.sh
 
 Die Build-Schritte liefen früher über `bash -lc`. Eine Login-Shell liest `/etc/profile`; ist die Datei für den `tolaria`-User nicht lesbar, bricht die Profilauswertung ab und der `PATH` geht verloren. Der Installer setzt `/etc/profile` deshalb auf 644, ruft `pnpm` über den absolut ermittelten Pfad auf und nutzt `bash -c` mit explizitem `PATH` statt einer Login-Shell.
 
-Zusätzlich lief das Setup früher mit `umask 077`. Dadurch legten Paket-Postinsts und `npm install -g` Dateien wie `/etc/ssl/openssl.cnf` oder `pnpm` als `root:root` mit Modus 600 an; der Build-Benutzer `tolaria` bekam `Permission denied`. Das Setup nutzt jetzt `umask 022`, setzt sensible Dateien explizit auf 600/640 und korrigiert die Rechte von pnpm, `/etc/ssl` und `/etc/ssl/openssl.cnf`.
+Zusätzlich lief das Setup früher mit `umask 077`. Dadurch legten Paket-Postinsts und `npm install -g` Dateien wie `/etc/ssl/openssl.cnf` oder `pnpm` als `root:root` mit Modus 600 an; der Build-Benutzer `tolaria` bekam `Permission denied`. Das Setup nutzt jetzt `umask 022`, setzt sensible Dateien explizit auf 600/640 und korrigiert die Rechte von pnpm, `/etc/ssl` und `/etc/ssl/openssl.cnf`. Für den Build wird zusätzlich `OPENSSL_CONF=/dev/null` gesetzt (Node nutzt eigene CA-Roots), damit ein nicht lesbares OpenSSL-Config den Build nicht blockiert; bei Bedarf zeigt `namei -l /etc/ssl/openssl.cnf` die tatsächlichen Pfadrechte im Log.
 
 ### `fatal: not in a git directory` beim Vault-Seeding
 
