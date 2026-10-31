@@ -196,6 +196,23 @@ if [[ -z "$EFFECTIVE_DNS" ]]; then
 fi
 TOLARIA_DNS_SERVERS="$EFFECTIVE_DNS"
 
+# Diese Optionen gelten für JEDEN apt-Aufruf im Container, auch für
+# apt-get-Aufrufe innerhalb des NodeSource-Setup-Skripts. Ohne ForceIPv4
+# kann apt in einem IPv4-only-Container AAAA-Antworten bevorzugen; die
+# reduzierte Parallelität schont einen flakigen Resolver zusätzlich.
+APT_CONF="/etc/apt/apt.conf.d/99tolaria-network"
+if [[ -d /etc/apt/apt.conf.d ]]; then
+  cat > "$APT_CONF" <<'EOF'
+Acquire::ForceIPv4 "true";
+Acquire::Retries "5";
+Acquire::http::Timeout "30";
+Acquire::https::Timeout "30";
+Acquire::http::Pipeline-Depth "0";
+Acquire::Queue-Mode "access";
+EOF
+  chmod 644 "$APT_CONF"
+fi
+
 # ---------------------------------------------------------------------------
 # apt-Hosts vorab auflösen
 # ---------------------------------------------------------------------------
@@ -214,6 +231,7 @@ TOLARIA_DNS_SERVERS="$EFFECTIVE_DNS"
 APT_HOSTS_PIN="${PKG_DIR}/apt-hosts-pin.sh"
 APT_HOSTS_PINNED=0
 APT_HOSTS_FILE="${APT_HOSTS_FILE:-/etc/hosts}"
+NSSWITCH_FILE="${NSSWITCH_FILE:-/etc/nsswitch.conf}"
 APT_HOSTS_BEGIN="# >>> tolaria-apt-hosts >>>"
 APT_HOSTS_END="# <<< tolaria-apt-hosts <<<"
 APT_HOSTS_LIST="deb.debian.org security.debian.org deb.nodesource.com"
@@ -269,8 +287,79 @@ apt_hosts_verified() {
   grep -qxF "${ip} deb.debian.org" "$APT_HOSTS_FILE"
 }
 
+# Stellt sicher, dass die Namensauflösung /etc/hosts überhaupt liest.
+# In manchen Containern steht in nsswitch.conf "hosts: resolve ..." oder
+# "hosts: dns files"; dann liefert getent eine DNS-Antwort und der Pin wird
+# zwar als "verifiziert" erkannt (gleiche IP), apt fragt aber weiter DNS und
+# scheitert unter Last. Ein Sentinel-Hostname macht das sichtbar.
+ensure_hosts_lookup() {
+  local sentinel="tolaria-hosts-check.invalid"
+  local tmp ok=0
+
+  # Ohne getent können wir die Auflösung nicht prüfen; dann lieber nichts
+  # an nsswitch.conf ändern.
+  command -v getent >/dev/null 2>&1 || return 0
+
+  if [[ ! -f "$APT_HOSTS_FILE" ]]; then
+    : > "$APT_HOSTS_FILE" || return 1
+  fi
+  if [[ ! -f "$NSSWITCH_FILE" ]]; then
+    printf 'hosts: files dns\n' > "$NSSWITCH_FILE" || return 1
+  fi
+
+  printf '127.0.0.1 %s\n' "$sentinel" >> "$APT_HOSTS_FILE" || return 1
+  if getent ahostsv4 "$sentinel" 2>/dev/null | awk 'NR==1 {print $1}' | grep -qx '127.0.0.1'; then
+    ok=1
+  fi
+  tmp="$(mktemp "${APT_HOSTS_FILE}.tolaria.XXXXXX")" || return 1
+  if ! awk -v s="$sentinel" '$NF != s' "$APT_HOSTS_FILE" > "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  cat "$tmp" > "$APT_HOSTS_FILE"
+  rm -f "$tmp"
+  (( ok )) && return 0
+
+  msg_warn "Namensauflösung ignoriert /etc/hosts - setze in ${NSSWITCH_FILE} 'hosts: files dns'."
+  cp -a "$NSSWITCH_FILE" "${NSSWITCH_FILE}.tolaria.bak" 2>/dev/null || true
+  tmp="$(mktemp "${NSSWITCH_FILE}.tolaria.XXXXXX")" || return 1
+  if ! awk '
+    /^[[:space:]]*hosts:/ {
+      if (!done) { print "hosts: files dns"; done = 1 }
+      next
+    }
+    { print }
+    END { if (!done) print "hosts: files dns" }
+  ' "$NSSWITCH_FILE" > "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  cat "$tmp" > "$NSSWITCH_FILE"
+  rm -f "$tmp"
+
+  printf '127.0.0.1 %s\n' "$sentinel" >> "$APT_HOSTS_FILE" || return 1
+  if getent ahostsv4 "$sentinel" 2>/dev/null | awk 'NR==1 {print $1}' | grep -qx '127.0.0.1'; then
+    ok=1
+  fi
+  tmp="$(mktemp "${APT_HOSTS_FILE}.tolaria.XXXXXX")" || return 1
+  if ! awk -v s="$sentinel" '$NF != s' "$APT_HOSTS_FILE" > "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  cat "$tmp" > "$APT_HOSTS_FILE"
+  rm -f "$tmp"
+
+  if (( ok )); then
+    msg_ok "Namensauflösung liest /etc/hosts (${NSSWITCH_FILE} korrigiert)."
+    return 0
+  fi
+  msg_error "Namensauflösung ignoriert /etc/hosts weiterhin - Host-Pinning kann apt nicht retten."
+  return 1
+}
+
 pin_apt_hosts() {
   APT_HOSTS_PINNED=0
+  ensure_hosts_lookup || msg_warn "Hosts-Pinning läuft ohne garantierte /etc/hosts-Auflösung."
   if [[ -f "$APT_HOSTS_PIN" ]]; then
     if ! bash "$APT_HOSTS_PIN" pin; then
       msg_warn "apt-hosts-pin.sh ist fehlgeschlagen - nutze eingebauten Fallback."

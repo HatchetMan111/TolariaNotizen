@@ -266,6 +266,61 @@ else
   fail "Setup: eingebauter Pin-Fallback funktioniert ohne apt-hosts-pin.sh"
 fi
 
+# nsswitch.conf muss /etc/hosts vor DNS fragen. Sonst liefert getent zwar
+# eine (gleiche) DNS-IP, apt fragt aber weiter DNS und scheitert unter Last.
+# Die Funktion wird mit einem kontrollierten getent getestet.
+NSS_BIN="$TMP_DIR/nssbin"
+mkdir -p "$NSS_BIN"
+cat > "$NSS_BIN/getent" <<'EOF'
+#!/usr/bin/env sh
+if [ "${FAKE_HOSTS_OK:-0}" = "1" ]; then
+  printf '127.0.0.1\n'
+  exit 0
+fi
+exit 2
+EOF
+chmod +x "$NSS_BIN/getent"
+
+NSS_HARNESS="$TMP_DIR/nss-harness.sh"
+{
+  echo '#!/usr/bin/env bash'
+  echo 'set -euo pipefail'
+  echo 'msg_info() { echo "[INFO] $*"; }'
+  echo 'msg_ok() { echo "[OK] $*"; }'
+  echo 'msg_warn() { echo "[WARN] $*"; }'
+  echo 'msg_error() { echo "[ERROR] $*" >&2; }'
+  echo 'PKG_DIR="$1"'
+  sed -n '/^# >>> tolaria-inline-pin >>>/,/^# <<< tolaria-inline-pin <<</p' "$SETUP_FILE" | sed '1d;$d'
+  echo 'ensure_hosts_lookup || true'
+} > "$NSS_HARNESS"
+
+NSS_OK="$TMP_DIR/nss-ok"
+printf 'hosts: files dns\n' > "$NSS_OK"
+NSS_OK_HOSTS="$TMP_DIR/nss-ok-hosts"
+printf '127.0.0.1 localhost\n' > "$NSS_OK_HOSTS"
+if env PATH="$NSS_BIN:$PATH" FAKE_HOSTS_OK=1 \
+     APT_HOSTS_FILE="$NSS_OK_HOSTS" NSSWITCH_FILE="$NSS_OK" \
+     bash "$NSS_HARNESS" "$TMP_DIR/no-pin-script" >/dev/null 2>&1 \
+   && grep -qx 'hosts: files dns' "$NSS_OK"; then
+  pass "Setup: funktionierende hosts-Auflösung bleibt unverändert"
+else
+  fail "Setup: funktionierende hosts-Auflösung bleibt unverändert"
+fi
+
+NSS_BAD="$TMP_DIR/nss-bad"
+printf 'hosts: resolve files\n' > "$NSS_BAD"
+NSS_BAD_HOSTS="$TMP_DIR/nss-bad-hosts"
+printf '127.0.0.1 localhost\n' > "$NSS_BAD_HOSTS"
+env PATH="$NSS_BIN:$PATH" FAKE_HOSTS_OK=0 \
+  APT_HOSTS_FILE="$NSS_BAD_HOSTS" NSSWITCH_FILE="$NSS_BAD" \
+  bash "$NSS_HARNESS" "$TMP_DIR/no-pin-script" >/dev/null 2>&1 || true
+if grep -qx 'hosts: files dns' "$NSS_BAD" \
+   && ! grep -q 'tolaria-hosts-check' "$NSS_BAD_HOSTS"; then
+  pass "Setup: nsswitch wird auf files-first korrigiert"
+else
+  fail "Setup: nsswitch wird auf files-first korrigiert"
+fi
+
 echo ""
 echo "== Packaging-Tarball =="
 # Der Host-Installer lädt Packaging als einen konsistenten Tarball. Hier
@@ -503,6 +558,10 @@ run "Setup: apt-Hosts werden gepinnt" grep -q 'apt-hosts-pin.sh' "$CT_SETUP"
 run "Setup: Pinning wird entfernt" grep -qF '"$APT_HOSTS_PIN" unpin' "$CT_SETUP"
 run "Setup: eingebauter Pin-Fallback" grep -q 'apt_hosts_pin_inline' "$CT_SETUP"
 run "Setup: Pin wird verifiziert" grep -q 'apt_hosts_verified' "$CT_SETUP"
+run "Setup: hosts-Auflösung wird geprüft" grep -q 'ensure_hosts_lookup' "$CT_SETUP"
+run "Setup: nsswitch wird korrigiert" grep -q 'NSSWITCH_FILE' "$CT_SETUP"
+run "Setup: apt nutzt immer IPv4" grep -q 'Acquire::ForceIPv4 "true"' "$CT_SETUP"
+run "Setup: apt-Parallelität reduziert" grep -q 'Acquire::Queue-Mode "access"' "$CT_SETUP"
 run "Setup: Pin-Fehler bricht Setup nicht ab" grep -q 'pin_apt_hosts || msg_warn' "$CT_SETUP"
 run "Setup: mehrere A-Records pro Host" grep -q 'head -n2' "$CT_SETUP"
 run "Setup: apt-Diagnose vorhanden" grep -q 'apt_diag' "$CT_SETUP"

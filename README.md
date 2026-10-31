@@ -246,6 +246,8 @@ Wenn `getent ahostsv4 deb.debian.org` eine Adresse liefert, apt beim Download ab
 
 Das Pinning steckt sowohl in `scripts/apt-hosts-pin.sh` als auch als eingebauter Fallback direkt in `setup-in-container.sh`. Damit scheitert es nicht daran, dass ein veraltetes Host-Skript die separate Datei nicht in den Container kopiert hat.
 
+Zusätzlich prüft der Installer mit einem Sentinel-Hostnamen, ob die Namensauflösung `/etc/hosts` überhaupt liest. Steht in `/etc/nsswitch.conf` z. B. `hosts: resolve ...` oder `hosts: dns files`, liefert `getent` zwar eine IP (und der Pin sieht „verifiziert“ aus), apt fragt aber weiter DNS. In diesem Fall setzt der Installer die `hosts:`-Zeile auf `hosts: files dns` (Backup: `/etc/nsswitch.conf.tolaria.bak`). Außerdem gilt für alle apt-Aufrufe im Container `/etc/apt/apt.conf.d/99tolaria-network` mit `Acquire::ForceIPv4`, Retries, Timeouts und reduzierter Parallelität (`Queue-Mode access`).
+
 Schlägt apt trotz aktiven Pins fehl, bleibt der Pin zunächst aktiv und der Installer versucht es mit frischen Listen erneut. Erst wenn das ebenfalls scheitert, entfernt er den Pin für einen letzten DNS-Versuch. Die Diagnose (Pin-Block, A/AAAA, Proxy-Schlüssel, letzte apt-Zeilen) landet im Build-Log; die apt-Rohausgabe steht in `/root/tolaria-apt-update.log`.
 
 Manuell prüfen:
@@ -371,6 +373,8 @@ In dieser Umgebung wurde **kein echter Proxmox-Host** ausgeführt. Validiert wur
 - DNS-Reparatur (`scripts/repair-dns.sh`): Rendering der `resolv.conf`, Validierung von Nameservern, Ablehnung ungültiger Eingaben, Fallback-Nameserver, Backup/Restore, IPv4/A-Record-Prüfung und idempotentes Festschreiben gegen DHCP (`supersede`)
 - apt-Host-Pinning (`scripts/apt-hosts-pin.sh`): Auflösen, markierter `/etc/hosts`-Block, Idempotenz und restloses Entfernen (funktional getestet); mehrere A-Records pro Host, Zeilenumbruch-sichere Marker und Hostnamen-Validierung
 - Eingebauter Pinning-Fallback in `setup-in-container.sh` (funktional getestet), damit ein veraltetes Host-Skript das Pinning nicht aushebeln kann
+- `ensure_hosts_lookup`: Sentinel-Test und Korrektur von `nsswitch.conf` auf `hosts: files dns` (funktional mit kontrolliertem `getent` getestet)
+- apt-Grundeinstellungen im Container: `ForceIPv4`, Retries, Timeouts und `Queue-Mode access`
 - Verifikation des Pins über `getent ahostsv4` plus `/etc/hosts`-Abgleich; apt versucht bei Fehlern zuerst erneut mit Pin und entfernt ihn erst für den letzten DNS-Versuch
 - Packaging als atomarer Tarball inkl. Cache-Buster und Raw-Fallback: lokaler Tarball, `file://`-Tarball und echter `codeload.github.com`-Download getestet
 - Persistenz der tatsächlich funktionierenden Nameserver in der CT-Config (statisch geprüft); wird jetzt auch bei bereits funktionierendem DNS geschrieben
