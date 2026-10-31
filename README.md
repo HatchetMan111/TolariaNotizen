@@ -252,6 +252,8 @@ Ein weiterer Stolperstein sind die Dateirechte: apt lädt als Benutzer `_apt`. I
 
 Falls apt trotz verifiziertem Pin weiter DNS fragt, startet der Installer zusätzlich einen **lokalen apt-Proxy** ([scripts/apt-proxy.pl](scripts/apt-proxy.pl)) auf `127.0.0.1:3142`. Er bekommt die gepinnten IPs als Mapping, leitet HTTP und HTTPS-CONNECT dorthin weiter und umgeht damit apts eigenen Resolver vollständig. Der Proxy läuft nur während der Installation; danach werden Konfiguration und Prozess entfernt. Voraussetzung ist `perl-base` (in Debian 12 enthalten); fehlt Perl, läuft apt wie bisher direkt.
 
+Vor der NodeSource-Phase prüft der Installer außerdem **CA-Bundle und Debian-Keyring**. Fehlen sie (oder sind sie veraltet), scheitert der HTTPS-Zugriff auf `deb.nodesource.com` mit `Certificate verification failed` bzw. `No system certificates available`; apt installiert dann das alte Debian-Node 18 statt 22. Der Installer installiert `ca-certificates` und `debian-archive-keyring` bei Bedarf neu und führt `update-ca-certificates --fresh` aus. Für die Dauer des NodeSource-Setups nutzen auch `curl` und das Setup-Skript den lokalen Proxy (`http_proxy`/`https_proxy`).
+
 Schlägt apt trotz aktiven Pins fehl, bleibt der Pin zunächst aktiv und der Installer versucht es mit frischen Listen erneut. Erst wenn das ebenfalls scheitert, entfernt er den Pin für einen letzten DNS-Versuch. Die Diagnose (Pin-Block, A/AAAA, Proxy-Schlüssel, letzte apt-Zeilen) landet im Build-Log; die apt-Rohausgabe steht in `/root/tolaria-apt-update.log`.
 
 Manuell prüfen:
@@ -380,7 +382,8 @@ In dieser Umgebung wurde **kein echter Proxmox-Host** ausgeführt. Validiert wur
 - Eingebauter Pinning-Fallback in `setup-in-container.sh` (funktional getestet), damit ein veraltetes Host-Skript das Pinning nicht aushebeln kann
 - `ensure_hosts_lookup`: Sentinel-Test und Korrektur von `nsswitch.conf` auf `hosts: files dns` (funktional mit kontrolliertem `getent` getestet)
 - apt-Grundeinstellungen im Container: `ForceIPv4`, Retries, Timeouts und `Queue-Mode access`
-- Lokaler apt-Proxy (`scripts/apt-proxy.pl`): HTTP-Weiterleitung über Host-Mapping funktional getestet, inklusive HTTPS-`CONNECT` (manuell mit lokalem TLS-Server)
+- Lokaler apt-Proxy (`scripts/apt-proxy.pl`): HTTP-Weiterleitung über Host-Mapping funktional getestet, inklusive HTTPS-`CONNECT` (manuell mit lokalem TLS-Server und echtem apt-Update)
+- CA-/Keyring-Reparatur vor NodeSource (`ca-certificates`, `debian-archive-keyring`, `update-ca-certificates --fresh`)
 - Verifikation des Pins über `getent ahostsv4` plus `/etc/hosts`-Abgleich; apt versucht bei Fehlern zuerst erneut mit Pin und entfernt ihn erst für den letzten DNS-Versuch
 - Packaging als atomarer Tarball inkl. Cache-Buster und Raw-Fallback: lokaler Tarball, `file://`-Tarball und echter `codeload.github.com`-Download getestet
 - Persistenz der tatsächlich funktionierenden Nameserver in der CT-Config (statisch geprüft); wird jetzt auch bei bereits funktionierendem DNS geschrieben

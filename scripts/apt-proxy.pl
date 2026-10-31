@@ -30,7 +30,9 @@ if (open my $fh, '<', $mapfile) {
         next if $line =~ /^\s*(#|$)/;
         my ($host, $ip) = split /\s+/, $line;
         next unless defined $host && defined $ip;
-        $map{lc $host} = $ip;
+        $host = lc $host;
+        my $list = $map{$host} //= [];
+        push @$list, $ip unless grep { $_ eq $ip } @$list;
     }
     close $fh;
 }
@@ -63,9 +65,23 @@ while (my $client = $server->accept) {
 
 sub connect_upstream {
     my ($host, $port, $map) = @_;
-    my $addr = $map->{lc $host} // $host;
+    my $ips = $map->{lc $host};
+    if ($ips) {
+        for my $addr (@$ips) {
+            my $sock = IO::Socket::INET->new(
+                PeerAddr => $addr,
+                PeerPort => $port,
+                Proto    => 'tcp',
+                Timeout  => 20,
+            );
+            return $sock if $sock;
+        }
+        # Keine der gepinnten IPs erreichbar: nicht heimlich auf DNS
+        # ausweichen, sonst verschleiert der Proxy nur das eigentliche Problem.
+        return;
+    }
     return IO::Socket::INET->new(
-        PeerAddr => $addr,
+        PeerAddr => $host,
         PeerPort => $port,
         Proto    => 'tcp',
         Timeout  => 20,
@@ -104,6 +120,12 @@ sub handle_client {
     $proto //= 'HTTP/1.1';
 
     if (uc $method eq 'CONNECT') {
+        # apt sendet nach der CONNECT-Zeile noch Header (mind. Host:).
+        # Diese müssen konsumiert werden, sonst landen sie vor dem
+        # TLS-ClientHello beim Zielserver und die Zertifikatsprüfung scheitert.
+        while (my $line = <$client>) {
+            last if $line =~ /^\r?\n$/;
+        }
         my ($host, $port) = split(/:/, $target, 2);
         $port //= 443;
         my $up = connect_upstream($host, $port, $map);

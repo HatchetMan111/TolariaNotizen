@@ -128,7 +128,7 @@ FORCE_BUILD="${FORCE_BUILD:-0}"
 
 APT_PACKAGES=(
   ca-certificates curl gnupg git build-essential python3
-  nginx apache2-utils openssl procps iproute2
+  debian-archive-keyring nginx apache2-utils openssl procps iproute2
 )
 APT_OPTS=(
   -o Acquire::Retries=5
@@ -633,6 +633,35 @@ if (( ${#missing_cmds[@]} > 0 )); then
 fi
 
 # ---------------------------------------------------------------------------
+# CA-Bundle und Debian-Keyring
+# ---------------------------------------------------------------------------
+# Der NodeSource-Repo-Zugriff läuft über HTTPS. Fehlt das CA-Bundle oder ist
+# der Keyring unvollständig, scheitert apt mit "No system certificates" bzw.
+# NO_PUBKEY und installiert anschließend das alte Debian-Node statt 22.
+msg_info "Prüfe CA-Bundle und Debian-Keyring ..."
+if ! retry 2 5 apt-get install -y --reinstall --no-install-recommends \
+      "${APT_OPTS[@]}" ca-certificates debian-archive-keyring; then
+  msg_warn "Reinstall von ca-certificates/debian-archive-keyring fehlgeschlagen."
+fi
+if command -v update-ca-certificates >/dev/null 2>&1; then
+  update-ca-certificates --fresh >/dev/null 2>&1 \
+    || msg_warn "update-ca-certificates meldet einen Fehler."
+fi
+if [[ -s /etc/ssl/certs/ca-certificates.crt ]]; then
+  msg_ok "CA-Bundle vorhanden ($(wc -c < /etc/ssl/certs/ca-certificates.crt) Bytes)."
+else
+  msg_error "CA-Bundle fehlt: /etc/ssl/certs/ca-certificates.crt"
+  msg_error "NodeSource (HTTPS) kann ohne CA-Bundle nicht funktionieren."
+  msg_error "Im Container prüfen: dpkg -l ca-certificates; update-ca-certificates --fresh"
+  exit 1
+fi
+if retry 2 5 apt_update_once; then
+  msg_ok "Paketlisten nach Keyring-Update aktualisiert."
+else
+  msg_warn "apt-get update nach Keyring-Update fehlgeschlagen."
+fi
+
+# ---------------------------------------------------------------------------
 # Node 22.14+ und pnpm 10.33.0
 # ---------------------------------------------------------------------------
 need_node=0
@@ -653,6 +682,13 @@ if [[ "$need_node" == "1" ]]; then
   else
     msg_warn "NodeSource-Pin nicht verifiziert - nutze DNS."
   fi
+  # curl (NodeSource-Setup) und das Setup-Skript selbst sollen denselben
+  # lokalen Proxy nutzen wie apt. Sonst hängt der nächste Schritt wieder an DNS.
+  if (( APT_PROXY_ACTIVE )); then
+    export http_proxy="http://127.0.0.1:${APT_PROXY_PORT}"
+    export https_proxy="$http_proxy"
+    export no_proxy="localhost,127.0.0.1"
+  fi
   if ! retry 3 5 curl -fsSL --max-time 60 https://deb.nodesource.com/setup_22.x -o /tmp/nodesource_setup.sh; then
     msg_error "NodeSource-Setup konnte nicht geladen werden (https://deb.nodesource.com)."
     msg_error "Prüfe DNS/Internet/Proxy im Container."
@@ -660,6 +696,7 @@ if [[ "$need_node" == "1" ]]; then
   fi
   bash /tmp/nodesource_setup.sh
   rm -f /tmp/nodesource_setup.sh
+  unset http_proxy https_proxy no_proxy
   if ! retry 3 10 apt-get install -y "${APT_OPTS[@]}" nodejs; then
     msg_error "Node.js konnte nicht installiert werden."
     exit 1
