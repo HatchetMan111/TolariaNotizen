@@ -444,6 +444,16 @@ run "sub/page.md im Commit" bash -c "git --git-dir='$VAULT' show HEAD:sub/page.m
 SECOND="$(env VAULT_OWNER="$(id -un)" VAULT_GROUP="$(id -gn)" \
   bash "$REPO_ROOT/scripts/seed-vault.sh" "$VAULT" "$SEED" 2>&1)"
 if grep -q 'bereits geseedet' <<<"$SECOND"; then pass "zweiter Lauf überspringt"; else fail "zweiter Lauf überschreibt nicht"; fi
+
+# Ein geerbtes GIT_DIR darf das Seeding nicht auf ein fremdes Repo umbiegen.
+GIT_DIR_VAULT="$TMP_DIR/vault-git-dir.git"
+if env GIT_DIR=/nonexistent VAULT_OWNER="$(id -un)" VAULT_GROUP="$(id -gn)" \
+     bash "$REPO_ROOT/scripts/seed-vault.sh" "$GIT_DIR_VAULT" "$SEED" >/dev/null 2>&1 \
+   && git --git-dir="$GIT_DIR_VAULT" rev-parse --verify HEAD >/dev/null 2>&1; then
+  pass "seed ignoriert ein geerbtes GIT_DIR"
+else
+  fail "seed ignoriert ein geerbtes GIT_DIR"
+fi
 NOTBARE="$TMP_DIR/notbare"
 mkdir -p "$NOTBARE"
 if env VAULT_OWNER="$(id -un)" VAULT_GROUP="$(id -gn)" \

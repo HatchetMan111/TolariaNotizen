@@ -9,6 +9,12 @@
 set -euo pipefail
 umask 077
 
+# Ein geerbtes GIT_DIR/GIT_WORK_TREE würde alle "git -C $TMP_DIR"-Aufrufe
+# auf ein fremdes Repository umbiegen und mit "fatal: not in a git directory"
+# scheitern. Das Seeding braucht eine saubere Git-Umgebung.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
+      GIT_COMMON_DIR GIT_NAMESPACE GIT_CEILING_DIRECTORIES
+
 VAULT_DIR="${1:-/var/lib/tolaria/vault.git}"
 SEED_DIR="${2:-/opt/tolaria/src/demo-vault-v2}"
 VAULT_OWNER="${VAULT_OWNER:-tolaria}"
@@ -18,6 +24,8 @@ msg_info()  { echo "[INFO]  $*"; }
 msg_ok()    { echo "[OK]    $*"; }
 msg_warn()  { echo "[WARN]  $*"; }
 msg_error() { echo "[ERROR] $*" >&2; }
+
+trap 'msg_error "seed-vault: fehlgeschlagen in Zeile ${LINENO}: ${BASH_COMMAND}"; exit 1' ERR
 
 [[ -d "$SEED_DIR" ]] || { msg_error "Seed-Verzeichnis fehlt: $SEED_DIR"; exit 1; }
 [[ -n "$(find "$SEED_DIR" -mindepth 1 -maxdepth 1 -print -quit)" ]] \

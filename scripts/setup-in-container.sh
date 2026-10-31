@@ -11,7 +11,7 @@ umask 077
 export PATH="/usr/local/bin:/usr/local/sbin:${PATH}"
 
 APP="tolaria"
-SETUP_VERSION="2026-10-31.5"
+SETUP_VERSION="2026-10-31.6"
 BUILD_LOG="/root/tolaria-build.log"
 PKG_DIR="/root/tolaria-packaging"
 INSTALL_ENV="${PKG_DIR}/install.env"
