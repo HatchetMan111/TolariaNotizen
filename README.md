@@ -280,6 +280,10 @@ DNS_SERVERS="192.168.1.1" bash /tmp/tolaria.sh
 
 `pct set --nameserver` ist wichtig: Ohne den Eintrag in der CT-Config schreibt Proxmox die kaputte Datei beim nächsten Start wieder. Der Installer ist idempotent: Bei einem vorhandenen Container genügt ein erneuter Lauf, er repariert DNS und den DHCP-Schutz automatisch.
 
+### `fatal: not in a git directory` beim Vault-Seeding
+
+Das Seeding läuft in einem temporären Verzeichnis. Eine geerbte Git-Umgebung (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE` …) kann alle Git-Aufrufe auf ein fremdes Repository umbiegen; `git init` wirkt dann erfolgreich, aber `git config` scheitert. `seed-vault.sh` entfernt diese Variablen, nutzt explizite `--git-dir`/`--work-tree`-Pfade und prüft direkt nach `git init`, ob `.git` wirklich existiert. Bei einem Fehler nennt der ERR-Trap die exakte Zeile und den Befehl.
+
 ### Node.js bleibt bei Version 18 / NodeSource scheitert
 
 NodeSource läuft über apt und HTTPS. In Containern mit unvollständigem CA-Bundle, altem Debian-Keyring oder einer apt-HTTPS-Macke scheitert das Repo, und apt installiert das Debian-Node 18. Der Installer versucht NodeSource, prüft danach die Version und installiert bei Bedarf den **offiziellen Node-22-Tarball** von `nodejs.org` nach `/usr/local` (SHA256-geprüft, ohne apt/GPG). Die systemd-Unit wird dabei automatisch auf den tatsächlichen Node-Pfad umgeschrieben.
@@ -401,6 +405,7 @@ In dieser Umgebung wurde **kein echter Proxmox-Host** ausgeführt. Validiert wur
 - Lokaler apt-Proxy (`scripts/apt-proxy.pl`): HTTP-Weiterleitung über Host-Mapping funktional getestet, inklusive HTTPS-`CONNECT` (manuell mit lokalem TLS-Server und echtem apt-Update)
 - CA-/Keyring-Reparatur vor NodeSource (`ca-certificates`, `debian-archive-keyring`, `update-ca-certificates --fresh`)
 - Offizieller Node-22-Tarball als Fallback (SHA256-geprüft, nach `/usr/local`, systemd-Unit nutzt den tatsächlichen Pfad): Download und Extraktion funktional getestet
+- Vault-Seeding mit explizitem `--git-dir`/`--work-tree` und Bereinigung einer geerbten Git-Umgebung; funktional mit `GIT_DIR=/nonexistent` und dem echten `demo-vault-v2` getestet
 - Verifikation des Pins über `getent ahostsv4` plus `/etc/hosts`-Abgleich; apt versucht bei Fehlern zuerst erneut mit Pin und entfernt ihn erst für den letzten DNS-Versuch
 - Packaging als atomarer Tarball inkl. Cache-Buster und Raw-Fallback: lokaler Tarball, `file://`-Tarball und echter `codeload.github.com`-Download getestet
 - Persistenz der tatsächlich funktionierenden Nameserver in der CT-Config (statisch geprüft); wird jetzt auch bei bereits funktionierendem DNS geschrieben

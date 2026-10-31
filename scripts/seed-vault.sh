@@ -60,21 +60,32 @@ msg_info "Kopiere Seed-Inhalt und erzeuge Initial-Commit ..."
 cp -a "$SEED_DIR/." "$TMP_DIR/"
 rm -rf "$TMP_DIR/.git"
 
-git -C "$TMP_DIR" init -q
-git -C "$TMP_DIR" config user.name "Tolaria"
-git -C "$TMP_DIR" config user.email "tolaria@localhost"
-git -C "$TMP_DIR" config core.autocrlf false
-git -C "$TMP_DIR" add -A
+git init -q "$TMP_DIR"
+if [[ ! -d "$TMP_DIR/.git" ]]; then
+  msg_error "git init hat kein Repository in ${TMP_DIR} erzeugt."
+  msg_error "git: $(git --version 2>&1 || true)"
+  msg_error "GIT_DIR='${GIT_DIR:-<unset>}' GIT_WORK_TREE='${GIT_WORK_TREE:-<unset>}'"
+  ls -la "$TMP_DIR" 2>&1 | head -10 || true
+  exit 1
+fi
 
-if git -C "$TMP_DIR" diff --cached --quiet; then
+# Explizite Pfade statt "git -C": Damit kann ein geerbtes GIT_DIR oder ein
+# merkwürdiges cwd das Seeding nicht mehr auf ein fremdes Repo umbiegen.
+GIT_WT=(--git-dir="$TMP_DIR/.git" --work-tree="$TMP_DIR")
+git "${GIT_WT[@]}" config user.name "Tolaria"
+git "${GIT_WT[@]}" config user.email "tolaria@localhost"
+git "${GIT_WT[@]}" config core.autocrlf false
+git "${GIT_WT[@]}" add -A
+
+if git "${GIT_WT[@]}" diff --cached --quiet; then
   msg_error "Seed-Inhalt ergibt keinen Commit (alles ignoriert/leer?): $SEED_DIR"
   exit 1
 fi
 
-git -C "$TMP_DIR" commit -q -m "Initial Tolaria vault"
-git -C "$TMP_DIR" branch -M main
-git -C "$TMP_DIR" remote add origin "$VAULT_DIR"
-git -C "$TMP_DIR" push -q origin main
+git "${GIT_WT[@]}" commit -q -m "Initial Tolaria vault"
+git "${GIT_WT[@]}" branch -M main
+git "${GIT_WT[@]}" remote add origin "$VAULT_DIR"
+git "${GIT_WT[@]}" push -q origin main
 
 if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
   if id -u "$VAULT_OWNER" >/dev/null 2>&1; then
