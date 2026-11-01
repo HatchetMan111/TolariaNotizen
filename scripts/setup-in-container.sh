@@ -14,7 +14,7 @@ umask 022
 export PATH="/usr/local/bin:/usr/local/sbin:${PATH}"
 
 APP="tolaria"
-SETUP_VERSION="2026-11-01.1"
+SETUP_VERSION="2026-11-01.2"
 BUILD_LOG="/root/tolaria-build.log"
 PKG_DIR="/root/tolaria-packaging"
 INSTALL_ENV="${PKG_DIR}/install.env"
@@ -52,6 +52,13 @@ on_error() {
   echo ""
   msg_error "--- journalctl -u ${APP} (letzte 200 Zeilen) ---"
   journalctl -u "${APP}" --no-pager -n 200 2>&1 || true
+  if journalctl -u "${APP}" --no-pager -n 50 2>/dev/null \
+       | grep -qE '226/NAMESPACE|Failed to set up mount namespacing'; then
+    echo ""
+    msg_error "--- 226/NAMESPACE erkannt: LXC erlaubt systemd keine Mount-Namespaces ---"
+    msg_error "Host-Fix: pct set ${CTID} --features nesting=1 && pct reboot ${CTID}"
+    msg_error "Danach den Installer erneut ausführen (stellt die volle Härtung wieder her)."
+  fi
   echo ""
   msg_error "--- DNS / Netzwerk ---"
   cat /etc/resolv.conf 2>&1 || true
@@ -1232,20 +1239,96 @@ chmod 600 /root/tolaria-credentials.txt
 # ---------------------------------------------------------------------------
 # Start und Verifikation
 # ---------------------------------------------------------------------------
+# Unprivilegierte LXCs ohne nesting=1 dürfen systemd keine Mount-Namespaces
+# einrichten. Die Härtung der Unit (PrivateTmp, ProtectSystem, ReadWritePaths)
+# scheitert dann mit status=226/NAMESPACE:
+#   "Failed to set up mount namespacing: /run/systemd/unit-root/proc:
+#    Permission denied"
+# Primär muss nesting am Host aktiviert werden (macht der Host-Installer).
+# Für bestehende Container mit alter Config gibt es hier einen Drop-in-Fallback,
+# der nur die namespace-abhängigen Optionen abschaltet.
+TOLARIA_DROPIN_DIR="/etc/systemd/system/tolaria.service.d"
+TOLARIA_DROPIN="${TOLARIA_DROPIN_DIR}/10-lxc-namespace.conf"
+
+unit_namespace_failure() {
+  systemctl is-active --quiet "$APP" && return 1
+  local -a jargs=(-u "$APP" --no-pager -n 40)
+  # Nur Ereignisse seit dem letzten Restart betrachten: alte 226-Zeilen aus
+  # einem früheren Lauf dürfen keinen unnötigen Fallback auslösen.
+  [[ -n "${TOLARIA_JOURNAL_CURSOR:-}" ]] && jargs+=(--after-cursor "$TOLARIA_JOURNAL_CURSOR")
+  journalctl "${jargs[@]}" 2>/dev/null \
+    | grep -qE '226/NAMESPACE|Failed to set up mount namespacing'
+}
+
+install_namespace_dropin() {
+  install -d -m 755 "$TOLARIA_DROPIN_DIR"
+  cat > "$TOLARIA_DROPIN" <<'EOF'
+# Automatisch erzeugt vom Tolaria-Installer: Der LXC erlaubt systemd keine
+# Mount-Namespaces (226/NAMESPACE). Namespace-abhängige Optionen werden
+# deaktiviert. User, CapabilityBoundingSet, NoNewPrivileges und
+# RestrictAddressFamilies bleiben aktiv.
+[Service]
+PrivateTmp=no
+ProtectSystem=no
+ProtectHome=no
+ReadWritePaths=
+ProtectKernelTunables=no
+ProtectKernelModules=no
+ProtectKernelLogs=no
+ProtectControlGroups=no
+ProtectClock=no
+ProtectHostname=no
+EOF
+  chmod 644 "$TOLARIA_DROPIN"
+  systemctl daemon-reload
+}
+
+# Ein Drop-in aus einem früheren Fallback wird entfernt, damit zuerst die volle
+# Härtung versucht wird (z. B. nachdem am Host nesting=1 aktiviert wurde).
+if [[ -f "$TOLARIA_DROPIN" ]]; then
+  msg_info "Entferne alten Namespace-Fallback (volle Härtung wird erneut versucht) ..."
+  rm -f "$TOLARIA_DROPIN"
+  rmdir "$TOLARIA_DROPIN_DIR" 2>/dev/null || true
+  systemctl daemon-reload
+fi
+
 msg_info "Starte ${APP} ..."
+TOLARIA_JOURNAL_CURSOR="$(journalctl -u "$APP" -n 0 --show-cursor 2>/dev/null \
+  | sed -n 's/^-- cursor: //p' | head -n1 || true)"
 systemctl restart tolaria
 
 server_ok=0
+namespace_fallback=0
 for i in $(seq 1 60); do
   if curl -fsS "http://127.0.0.1:${SERVER_PORT}/healthz" >/dev/null 2>&1; then
     server_ok=1
     break
   fi
+  if (( i % 3 == 0 )) && (( namespace_fallback == 0 )) && unit_namespace_failure; then
+    msg_warn "systemd kann im LXC keine Mount-Namespaces einrichten (226/NAMESPACE)."
+    msg_warn "Aktiviere Namespace-Fallback (PrivateTmp/ProtectSystem aus)."
+    msg_warn "Besser am Proxmox-Host: pct set ${CTID} --features nesting=1 && pct reboot ${CTID}"
+    install_namespace_dropin
+    namespace_fallback=1
+    systemctl restart tolaria
+    sleep 2
+    continue
+  fi
   sleep 2
 done
 if [[ "$server_ok" != "1" ]]; then
   msg_error "Tolaria-Server antwortet nach 120 s nicht auf /healthz."
+  if unit_namespace_failure; then
+    msg_error "Ursache: 226/NAMESPACE - der LXC erlaubt systemd keine Mount-Namespaces."
+    msg_error "Host-Fix: pct set ${CTID} --features nesting=1 && pct reboot ${CTID}"
+  fi
+  msg_error "--- journalctl -u ${APP} (letzte 40 Zeilen) ---"
+  journalctl -u "$APP" --no-pager -n 40 2>&1 || true
   exit 1
+fi
+if (( namespace_fallback )); then
+  msg_warn "Tolaria läuft mit reduzierter systemd-Härtung (Namespace-Fallback)."
+  msg_warn "Volle Härtung nach Host-Fix: pct set ${CTID} --features nesting=1 && pct reboot ${CTID}, danach Installer erneut."
 fi
 msg_ok "Tolaria-Server: /healthz OK"
 

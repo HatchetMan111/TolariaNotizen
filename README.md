@@ -37,6 +37,7 @@ bash install/tolaria.sh --ctid 150 --cores 4 --memory 6144 --disk 12
 | Komponente | Details |
 |---|---|
 | Container | Debian 12, unprivilegiert, `onboot=1`, Hostname `tolaria` |
+| LXC-Features | `nesting=1` (für die systemd-Härtung; per `CT_FEATURES` anpassbar) |
 | Ressourcen | 4 vCPU, 6144 MB RAM, 4096 MB Swap, 12 GB Disk (änderbar) |
 | App | Tolaria Web-Build aus `refactoringhq/tolaria` (`pnpm build:web`) |
 | Server | Tolaria-Sync-Server (Node 22.14+, Port `127.0.0.1:8787`) |
@@ -92,6 +93,7 @@ Basic Auth auf `/v1/*` wäre technisch falsch: Der Client überschreibt den `Aut
 - Internetzugang für Template, `nodejs.org` (Node-Tarball), npm/pnpm und den Upstream-Build (NodeSource nur als Fallback)
 - Funktionierende DNS-Auflösung im Container. Der Installer übernimmt die Host-Nameserver, erkennt den systemd-resolved-Stub `127.0.0.53` und repariert `/etc/resolv.conf` automatisch. In Netzen ohne öffentlichen DNS: `--dns "192.168.1.1"`.
 - Mindestens 12 GB freier Storage, 6 GB RAM und 4 vCPU für den Build
+- `nesting=1` im Container (setzt der Installer; ohne das scheitert die systemd-Härtung mit `226/NAMESPACE`)
 - Port `8080` im LAN erreichbar (oder `--port` ändern)
 
 ## Optionen
@@ -119,7 +121,7 @@ Basic Auth auf `/v1/*` wäre technisch falsch: Der Client überschreibt den `Aut
 --help, -h           Hilfe
 ```
 
-Umgebungsvariablen funktionieren ebenfalls, z. B. `CT_ID`, `CORES`, `RAM`, `SWAP`, `DISK`, `BRIDGE`, `PORT`, `TOLARIA_REF`, `DNS_SERVERS`, `FORCE_BUILD`.
+Umgebungsvariablen funktionieren ebenfalls, z. B. `CT_ID`, `CORES`, `RAM`, `SWAP`, `DISK`, `BRIDGE`, `PORT`, `CT_FEATURES`, `TOLARIA_REF`, `DNS_SERVERS`, `FORCE_BUILD`.
 
 Für Packaging-Downloads gibt es zusätzlich:
 
@@ -135,13 +137,15 @@ Für Packaging-Downloads gibt es zusätzlich:
 
 ## Update
 
-Einfach den Einzeiler erneut ausführen. Der bestehende Container wird erkannt und wiederverwendet:
+Einfach den Einzeiler erneut ausführen. Der bestehende Container wird über seinen Hostnamen erkannt und wiederverwendet:
 
 ```bash
 wget -qO /tmp/tolaria.sh \
   "https://raw.githubusercontent.com/HatchetMan111/TolariaNotizen/main/install/tolaria.sh?cb=$(date +%s)" \
   && bash /tmp/tolaria.sh
 ```
+
+Gibt es mehrere Container mit dem Hostnamen `tolaria`, bricht der Installer bewusst ab und verlangt `--ctid <ID>`. So wird nie der falsche Container verändert. Ohne Treffer wird die nächste freie CT-ID verwendet.
 
 Ablauf beim Update:
 
@@ -367,6 +371,31 @@ Der Build-Log liegt im Container unter `/root/tolaria-build.log`:
 pct exec <CTID> -- tail -n 200 /root/tolaria-build.log
 ```
 
+### Service startet nicht: `status=226/NAMESPACE` / `Failed to set up mount namespacing`
+
+Symptom:
+
+```
+tolaria.service: Failed to set up mount namespacing: /run/systemd/unit-root/proc: Permission denied
+tolaria.service: Failed at step NAMESPACE spawning /usr/local/bin/node: Permission denied
+tolaria.service: Main process exited, code=exited, status=226/NAMESPACE
+```
+
+Ursache: Unprivilegierte LXC-Container ohne `nesting=1` dürfen systemd keine Mount-Namespaces einrichten. Die Härtung der Unit (`PrivateTmp`, `ProtectSystem`, `ReadWritePaths`) braucht genau das. Der Installer setzt `nesting=1` deshalb inzwischen standardmäßig (auch für bestehende Container) und startet den CT bei einer Änderung neu.
+
+Manuell prüfen/fixen:
+
+```bash
+pct config <CTID> | grep '^features:'
+pct set <CTID> --features nesting=1
+pct reboot <CTID>
+pct exec <CTID> -- systemctl status tolaria --no-pager --full
+```
+
+`nesting=1` ist für unprivilegierte Container gedacht. Proxmox weist darauf hin, dass dadurch procfs/sysfs des Hosts im Gast sichtbarer werden.
+
+Falls `nesting` nicht gesetzt werden kann, legt das Setup automatisch einen Drop-in an, der nur die namespace-abhängigen Optionen abschaltet (`/etc/systemd/system/tolaria.service.d/10-lxc-namespace.conf`). Der Dienst läuft dann, die Härtung ist aber reduziert. Nach `nesting=1` + Neustart entfernt der nächste Installer-Lauf den Drop-in und stellt die volle Härtung wieder her.
+
 ### Service läuft nicht
 
 ```bash
@@ -450,6 +479,8 @@ In dieser Umgebung wurde **kein echter Proxmox-Host** ausgeführt. Validiert wur
 - nginx-Template-Struktur
 - nginx 1.24 mit dem gerenderten Template lokal: Syntax, Basic-Auth auf `/` und `/tolaria-config.js`, kein Basic-Auth auf `/v1/`, Bearer-Passthrough, gzip/Asset-Caching und öffentliches `/healthz` als Proxy zum Server
 - systemd-Unit (soweit ohne `tolaria`-User/Pfade auf dem Testhost möglich)
+- `226/NAMESPACE`-Absicherung: `nesting=1` als LXC-Default (auch für bestehende Container + Neustart), automatischer Namespace-Drop-in-Fallback und explizite Host-Diagnose
+- Automatische Wiederverwendung eines vorhandenen Containers über den Hostnamen; bei Mehrdeutigkeit bewusster Abbruch statt falschem Ziel
 - Installer `--dry-run`, `--help` und Secret-Redaction
 - DNS-Reparatur (`scripts/repair-dns.sh`): Rendering der `resolv.conf`, Validierung von Nameservern, Ablehnung ungültiger Eingaben, Fallback-Nameserver, Backup/Restore, IPv4/A-Record-Prüfung und idempotentes Festschreiben gegen DHCP (`supersede`)
 - apt-Host-Pinning (`scripts/apt-hosts-pin.sh`): Auflösen, markierter `/etc/hosts`-Block, Idempotenz und restloses Entfernen (funktional getestet); mehrere A-Records pro Host, Zeilenumbruch-sichere Marker und Hostnamen-Validierung

@@ -23,7 +23,7 @@ umask 077
 # ---------------------------------------------------------------------------
 APP="tolaria"
 APP_TITLE="Tolaria"
-INSTALLER_VERSION="2026-11-01.1"
+INSTALLER_VERSION="2026-11-01.2"
 PORT="${PORT:-8080}"                            # nginx / Web-UI
 SERVER_PORT="8787"                              # Tolaria-Server, nur 127.0.0.1
 UPSTREAM_REPO="https://github.com/refactoringhq/tolaria.git"
@@ -45,7 +45,11 @@ DEFAULT_BRIDGE="${BRIDGE:-vmbr0}"
 DEFAULT_TEMPLATE_STORE="${TEMPLATE_STORE:-local}"
 DEFAULT_OS="debian-12-standard"
 UNPRIVILEGED="1"
-FEATURES=""                                     # kein Docker/nesting nötig
+# nesting=1 ist für unprivilegierte LXCs nötig, sobald eine Unit
+# namespace-abhängige Härtung nutzt (PrivateTmp, ProtectSystem, ReadWritePaths).
+# Ohne nesting scheitert tolaria.service mit 226/NAMESPACE. Über CT_FEATURES
+# (z. B. "keyctl=1,nesting=1") oder "" anpassbar.
+FEATURES="${CT_FEATURES:-nesting=1}"
 HOSTNAME_ARG="${CT_HOSTNAME:-$APP}"
 AUTH_USER="${AUTH_USER:-tolaria}"
 AUTH_PASS="${AUTH_PASS:-}"
@@ -108,6 +112,7 @@ Optionen:
   --help, -h           diese Hilfe
 
 Umgebung:
+  CT_FEATURES                 LXC-Features (Default: nesting=1; "" deaktiviert)
   TOLARIA_PACKAGING_REF       Branch/Tag/Commit für den Packaging-Tarball (Default: main)
   TOLARIA_PACKAGING_TARBALL   Eigene Tarball-URL oder lokaler Pfad
   TOLARIA_PACKAGING_DIR       Lokaler Checkout statt Download
@@ -311,7 +316,7 @@ if [[ "$DRY_RUN" == "1" ]]; then
   cat <<EOF
 ${APP_TITLE} - Dry Run (es wird nichts verändert)
 
-  CT-ID            : ${CTID:-<nächste freie ID via pvesh get /cluster/nextid>}
+  CT-ID            : ${CTID:-<vorhandener CT "Hostname ${HOSTNAME_ARG}", sonst nächste freie ID>}
   Hostname         : ${HOSTNAME_ARG}
   Ressourcen       : ${DEFAULT_CORES} vCPU / ${DEFAULT_RAM} MB RAM / ${DEFAULT_SWAP} MB Swap / ${DEFAULT_DISK} GB Disk
   Storage          : ${STORAGE_ARG:-auto (local-lvm bevorzugt)}
@@ -329,7 +334,7 @@ ${APP_TITLE} - Dry Run (es wird nichts verändert)
 
 Ablauf:
   1. Template ${DEFAULT_OS} sicherstellen
-  2. LXC erstellen/wiederverwenden, onboot=1, unprivileged=${UNPRIVILEGED}
+  2. LXC erstellen/wiederverwenden (Hostname-Suche ohne --ctid), onboot=1, unprivileged=${UNPRIVILEGED}, features=${FEATURES:-keine}
   3. DNS im CT prüfen und bei Bedarf reparieren (systemd-resolved-Stub)
   4. Node 22 + pnpm 10.33 + nginx + git im CT installieren
   5. Upstream klonen, pnpm install, pnpm build:web (übersprungen, wenn Commit unverändert)
@@ -392,24 +397,50 @@ if command -v lvs >/dev/null 2>&1; then
 fi
 msg_ok "Host-Checks bestanden."
 
-# ---------------------------------------------------------------------------
-# CT-ID: immer die nächste freie ID nehmen (außer explizit gesetzt)
-# ---------------------------------------------------------------------------
-if [[ -z "$CTID" ]]; then
-  msg_info "Ermittle nächste freie CT-ID ..."
-  CTID="$(pvesh get /cluster/nextid)"
-  msg_ok "Nächste freie CT-ID: $CTID"
-else
-  msg_info "CT-ID vorgegeben: $CTID"
-fi
-
-[[ "$CTID" =~ ^[1-9][0-9]*$ ]] || { msg_error "Ungültige CT-ID: $CTID"; exit 1; }
-
 HOSTNAME_FINAL="$HOSTNAME_ARG"
 if [[ ! "$HOSTNAME_FINAL" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]] || (( ${#HOSTNAME_FINAL} > 63 )); then
   msg_error "Ungültiger Hostname: $HOSTNAME_FINAL (1-63 Zeichen: Buchstaben, Zahlen, Bindestrich; nicht am Rand)"
   exit 1
 fi
+
+# ---------------------------------------------------------------------------
+# CT-ID: vorhandenen Tolaria-Container wiederverwenden, sonst nächste freie ID
+# ---------------------------------------------------------------------------
+# Ein einfacher Re-Run ohne --ctid hat bisher immer einen NEUEN Container
+# erzeugt. Das widerspricht dem dokumentierten idempotenten Update und lässt
+# verwaiste Container zurück. Deshalb wird bei fehlender CT-ID nach einem
+# Container mit dem Ziel-Hostnamen gesucht. Bei Mehrdeutigkeit wird bewusst
+# abgebrochen, statt den falschen Container zu verändern.
+find_existing_ctids() {
+  local id h
+  while read -r id; do
+    [[ -n "$id" ]] || continue
+    h="$(pct config "$id" 2>/dev/null | awk '/^hostname:/ {print $2; exit}' || true)"
+    if [[ "$h" == "$HOSTNAME_FINAL" ]]; then
+      printf '%s\n' "$id"
+    fi
+  done < <(pct list 2>/dev/null | awk 'NR > 1 && $1 ~ /^[0-9]+$/ {print $1}')
+}
+
+if [[ -z "$CTID" ]]; then
+  mapfile -t EXISTING_CTIDS < <(find_existing_ctids)
+  if (( ${#EXISTING_CTIDS[@]} == 1 )); then
+    CTID="${EXISTING_CTIDS[0]}"
+    msg_ok "Vorhandener Container ${CTID} (Hostname: ${HOSTNAME_FINAL}) wird wiederverwendet."
+  elif (( ${#EXISTING_CTIDS[@]} > 1 )); then
+    msg_error "Mehrere Container tragen den Hostnamen '${HOSTNAME_FINAL}': ${EXISTING_CTIDS[*]}"
+    msg_error "Bitte mit --ctid <ID> den gewünschten Container auswählen."
+    exit 1
+  else
+    msg_info "Ermittle nächste freie CT-ID ..."
+    CTID="$(pvesh get /cluster/nextid)"
+    msg_ok "Nächste freie CT-ID: $CTID"
+  fi
+else
+  msg_info "CT-ID vorgegeben: $CTID"
+fi
+
+[[ "$CTID" =~ ^[1-9][0-9]*$ ]] || { msg_error "Ungültige CT-ID: $CTID"; exit 1; }
 
 # ---------------------------------------------------------------------------
 # Storage-Erkennung
@@ -647,6 +678,7 @@ if [[ "$DEBUG" == "1" ]]; then
   set +x
 fi
 
+FEATURES_CHANGED=0
 if pct status "$CTID" >/dev/null 2>&1; then
   msg_warn "Container $CTID existiert bereits - wird wiederverwendet (idempotent, kein Neu-Erstellen)."
   EXISTING_HOST="$(pct config "$CTID" 2>/dev/null | awk '/^hostname:/ {print $2}' || true)"
@@ -658,6 +690,22 @@ if pct status "$CTID" >/dev/null 2>&1; then
     msg_warn "CT heißt '${EXISTING_HOST}', nicht '${HOSTNAME_FINAL}'. Name bleibt erhalten; mit --hostname änderbar."
   fi
   pct set "$CTID" --onboot 1
+
+  # nesting=1 ist für die systemd-Härtung der Unit erforderlich. Existing
+  # Container aus älteren Installer-Versionen haben es nicht und scheitern
+  # sonst mit "226/NAMESPACE" / "Failed to set up mount namespacing".
+  EXISTING_FEATURES="$(pct config "$CTID" 2>/dev/null \
+    | awk '/^features:/ {sub(/^features:[[:space:]]*/, ""); print; exit}' || true)"
+  if [[ -n "$FEATURES" ]] && ! grep -qE '(^|,)nesting(=1)?(,|$)' <<<"$EXISTING_FEATURES"; then
+    if [[ -n "$EXISTING_FEATURES" ]]; then
+      NEW_FEATURES="${EXISTING_FEATURES},nesting=1"
+    else
+      NEW_FEATURES="nesting=1"
+    fi
+    msg_info "Aktiviere LXC-Feature nesting (${NEW_FEATURES}) für systemd-Härtung ..."
+    pct set "$CTID" --features "$NEW_FEATURES"
+    FEATURES_CHANGED=1
+  fi
 else
   if [[ -z "$ROOT_PASSWORD" ]]; then
     ROOT_PASSWORD="$(openssl rand -hex 12)"
@@ -689,11 +737,16 @@ else
     CREATE_ARGS+=(--ssh-public-keys "$SSH_KEY")
   fi
   pct create "${CREATE_ARGS[@]}"
-  msg_ok "Container $CTID erstellt (Name: $HOSTNAME_FINAL, onboot=1, unprivileged=$UNPRIVILEGED)."
+  msg_ok "Container $CTID erstellt (Name: $HOSTNAME_FINAL, onboot=1, unprivileged=$UNPRIVILEGED, features=${FEATURES:-keine})."
 fi
 
 msg_info "Starte Container $CTID ..."
-if [[ "$(pct status "$CTID" 2>/dev/null | awk '{print $2}')" != "running" ]]; then
+if [[ "$(pct status "$CTID" 2>/dev/null | awk '{print $2}')" == "running" ]]; then
+  if (( FEATURES_CHANGED )); then
+    msg_info "Neustart, damit die neue LXC-/AppArmor-Konfiguration greift ..."
+    pct reboot "$CTID" 2>/dev/null || { pct stop "$CTID" 2>/dev/null || true; pct start "$CTID"; }
+  fi
+else
   pct start "$CTID"
 fi
 for i in $(seq 1 60); do
@@ -917,6 +970,7 @@ cat <<EOF
 ════════════════ INSTALLATION ERFOLGREICH ════════════════
   App          : ${APP_TITLE} - lokale Markdown-Wissensbasis
   Container    : CT ${CTID} (Hostname: ${HOSTNAME_FINAL}, unprivilegiert, onboot=1)
+  Features     : ${FEATURES:-keine}
   Ressourcen   : ${DEFAULT_CORES} vCPU / ${DEFAULT_RAM} MB RAM / ${DEFAULT_SWAP} MB Swap / ${DEFAULT_DISK} GB Disk
   Web UI       : http://${CONTAINER_IP}:${PORT}
   Login        : Benutzer: ${AUTH_USER}
