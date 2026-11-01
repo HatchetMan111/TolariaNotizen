@@ -89,7 +89,7 @@ Basic Auth auf `/v1/*` wäre technisch falsch: Der Client überschreibt den `Aut
 
 - Proxmox VE 8.x (getestet werden konnte nur statisch, siehe unten)
 - Root-Zugriff auf den Proxmox-Host
-- Internetzugang für Template, NodeSource, npm/pnpm und den Upstream-Build
+- Internetzugang für Template, `nodejs.org` (Node-Tarball), npm/pnpm und den Upstream-Build (NodeSource nur als Fallback)
 - Funktionierende DNS-Auflösung im Container. Der Installer übernimmt die Host-Nameserver, erkennt den systemd-resolved-Stub `127.0.0.53` und repariert `/etc/resolv.conf` automatisch. In Netzen ohne öffentlichen DNS: `--dns "192.168.1.1"`.
 - Mindestens 12 GB freier Storage, 6 GB RAM und 4 vCPU für den Build
 - Port `8080` im LAN erreichbar (oder `--port` ändern)
@@ -207,8 +207,6 @@ Host-Skript und Container-Setup tragen eine gemeinsame `INSTALLER_VERSION`/`SETU
 
 Trotzdem gilt: Nach einem Push den Einzeiler mit Cache-Buster verwenden:
 
-Trotzdem gilt: Nach einem Push den Einzeiler mit Cache-Buster verwenden:
-
 ```bash
 wget -qO /tmp/tolaria.sh \
   "https://raw.githubusercontent.com/HatchetMan111/TolariaNotizen/main/install/tolaria.sh?cb=$(date +%s)" \
@@ -256,7 +254,57 @@ Ein weiterer Stolperstein sind die Dateirechte: apt lädt als Benutzer `_apt`. I
 
 Falls apt trotz verifiziertem Pin weiter DNS fragt, startet der Installer zusätzlich einen **lokalen apt-Proxy** ([scripts/apt-proxy.pl](scripts/apt-proxy.pl)) auf `127.0.0.1:3142`. Er bekommt die gepinnten IPs als Mapping, leitet HTTP und HTTPS-CONNECT dorthin weiter und umgeht damit apts eigenen Resolver vollständig. Der Proxy läuft nur während der Installation; danach werden Konfiguration und Prozess entfernt. Voraussetzung ist `perl-base` (in Debian 12 enthalten); fehlt Perl, läuft apt wie bisher direkt.
 
-Vor der NodeSource-Phase prüft der Installer außerdem **CA-Bundle und Debian-Keyring**. Fehlen sie (oder sind sie veraltet), scheitert der HTTPS-Zugriff auf `deb.nodesource.com` mit `Certificate verification failed` bzw. `No system certificates available`; apt installiert dann das alte Debian-Node 18 statt 22. Der Installer installiert `ca-certificates` und `debian-archive-keyring` bei Bedarf neu und führt `update-ca-certificates --fresh` aus. Für die Dauer des NodeSource-Setups nutzen auch `curl` und das Setup-Skript den lokalen Proxy (`http_proxy`/`https_proxy`).
+Der Installer prüft außerdem **CA-Bundle und Debian-Keyring**. Fehlen sie oder sind sie veraltet, scheitert apt mit `NO_PUBKEY` bzw. `No system certificates available`. Zwei Dinge wurden dafür geändert:
+
+1. **Pfadrechte:** In manchen LXCs steht `/etc` auf `0700`. Dann können `_apt` und der Build-Benutzer `tolaria` die Dateien unter `/etc/ssl` und `/usr/share/keyrings` nicht erreichen, obwohl die Dateien selbst 644 sind. Das Setup ergänzt fehlende Ausführungsbits (`chmod a+x /etc`, `/etc/ssl`, …) und macht CA-Bundle/OpenSSL-Config lesbar. Das erklärt `The certificate issuer is unknown` / `No system certificates`; `NO_PUBKEY` kommt zusätzlich von einem veralteten Keyring (siehe nächster Abschnitt).
+2. **Keyring-Reparatur vor dem Entpinnen:** Der Reinstall von `ca-certificates`/`debian-archive-keyring` läuft jetzt, solange der Hosts-Pin und der lokale apt-Proxy noch aktiv sind. Scheitert der Reinstall trotzdem, wird das `.deb` per `apt-get download` über denselben Weg geladen und mit `dpkg -i` installiert. Erst danach wird der Pin entfernt.
+
+Node 22 kommt inzwischen **primär** als offizieller Tarball von `nodejs.org` (SHA256-geprüft, ohne apt/GPG). NodeSource ist nur noch Fallback für Umgebungen, in denen `nodejs.org` blockiert ist. Damit hängt der Node-Schritt nicht mehr an Debian-Keyring, apt-HTTPS oder der NodeSource-Repositories-Signatur.
+
+### `NO_PUBKEY ...` / `The following signatures couldn't be verified`
+
+Symptom im Log:
+
+```
+NO_PUBKEY 6ED0E7B82643E131
+NO_PUBKEY 78DBA3BC47EF2265
+NO_PUBKEY F8D2585B8783D481
+```
+
+Ursache ist ein **veralteter `debian-archive-keyring`** (typisch im Proxmox-Debian-12-Template). Der Installer versucht den Reinstall mit aktivem DNS-unabhängigem Pin/Proxy. Prüfen:
+
+```bash
+pct exec <CTID> -- dpkg -l debian-archive-keyring ca-certificates
+pct exec <CTID> -- stat -c '%a %U:%G %n' /etc /etc/ssl /usr/share/keyrings
+pct exec <CTID> -- runuser -u _apt -- test -r /etc/ssl/certs/ca-certificates.crt \
+  && echo "CA lesbar" || echo "CA NICHT lesbar"
+```
+
+Manuell reparieren:
+
+```bash
+pct exec <CTID> -- bash -c 'chmod a+x /etc /etc/ssl /usr/share/keyrings'
+pct exec <CTID> -- apt-get update -o Acquire::Retries=5
+pct exec <CTID> -- apt-get install --reinstall -y debian-archive-keyring ca-certificates
+pct exec <CTID> -- update-ca-certificates --fresh
+```
+
+Danach den Installer erneut ausführen. Node 22 wird auch ohne funktionierenden Keyring über den Tarball installiert.
+
+### `EAI_AGAIN registry.npmjs.org` bei `pnpm install`
+
+pnpm öffnet viele parallele Verbindungen. Ein Resolver, der einzelne Anfragen beantwortet, bricht unter dieser Last zusammen – im Log sichtbar als `getaddrinfo EAI_AGAIN registry.npmjs.org`. Der Installer pinnt deshalb zusätzlich `registry.npmjs.org`/`registry.npmjs.com` in `/etc/hosts` (derselbe markierte Block wie apt), begrenzt die Parallelität (`--network-concurrency=4`), erhöht die Retries und wiederholt `pnpm install` bis zu dreimal. Der pnpm-Store bleibt im Home von `tolaria`, sodass ein Retry bereits geladene Pakete wiederverwendet.
+
+Prüfen:
+
+```bash
+pct exec <CTID> -- grep -A8 tolaria-apt-hosts /etc/hosts
+pct exec <CTID> -- getent ahostsv4 registry.npmjs.org
+pct exec <CTID> -- runuser -u tolaria -- bash -lc \
+  'cd /opt/tolaria/src && pnpm install --frozen-lockfile --network-concurrency=4 --fetch-retries=8'
+```
+
+Der Block wird am Ende der Installation automatisch entfernt. Bleibt er nach einem Abbruch stehen, entfernt ihn der nächste Lauf.
 
 Schlägt apt trotz aktiven Pins fehl, bleibt der Pin zunächst aktiv und der Installer versucht es mit frischen Listen erneut. Erst wenn das ebenfalls scheitert, entfernt er den Pin für einen letzten DNS-Versuch. Die Diagnose (Pin-Block, A/AAAA, Proxy-Schlüssel, letzte apt-Zeilen) landet im Build-Log; die apt-Rohausgabe steht in `/root/tolaria-apt-update.log`.
 
@@ -292,7 +340,7 @@ Das Seeding läuft in einem temporären Verzeichnis. Eine geerbte Git-Umgebung (
 
 ### Node.js bleibt bei Version 18 / NodeSource scheitert
 
-NodeSource läuft über apt und HTTPS. In Containern mit unvollständigem CA-Bundle, altem Debian-Keyring oder einer apt-HTTPS-Macke scheitert das Repo, und apt installiert das Debian-Node 18. Der Installer versucht NodeSource, prüft danach die Version und installiert bei Bedarf den **offiziellen Node-22-Tarball** von `nodejs.org` nach `/usr/local` (SHA256-geprüft, ohne apt/GPG). Die systemd-Unit wird dabei automatisch auf den tatsächlichen Node-Pfad umgeschrieben.
+Der Installer installiert Node 22 inzwischen **primär** über den offiziellen Tarball von `nodejs.org` (SHA256-geprüft, nach `/usr/local`, ohne apt/GPG). Das ist der zuverlässige Weg in Containern mit altem Debian-Keyring, unlesbarem CA-Bundle oder apt-HTTPS-Problemen. Nur wenn der Tarball nicht geladen werden kann, versucht der Installer NodeSource als Fallback. Die systemd-Unit wird auf den tatsächlichen Node-Pfad umgeschrieben.
 
 Prüfen:
 
@@ -409,8 +457,10 @@ In dieser Umgebung wurde **kein echter Proxmox-Host** ausgeführt. Validiert wur
 - `ensure_hosts_lookup`: Sentinel-Test und Korrektur von `nsswitch.conf` auf `hosts: files dns` (funktional mit kontrolliertem `getent` getestet)
 - apt-Grundeinstellungen im Container: `ForceIPv4`, Retries, Timeouts und `Queue-Mode access`
 - Lokaler apt-Proxy (`scripts/apt-proxy.pl`): HTTP-Weiterleitung über Host-Mapping funktional getestet, inklusive HTTPS-`CONNECT` (manuell mit lokalem TLS-Server und echtem apt-Update)
-- CA-/Keyring-Reparatur vor NodeSource (`ca-certificates`, `debian-archive-keyring`, `update-ca-certificates --fresh`)
-- Offizieller Node-22-Tarball als Fallback (SHA256-geprüft, nach `/usr/local`, systemd-Unit nutzt den tatsächlichen Pfad): Download und Extraktion funktional getestet
+- CA-/Keyring-Reparatur mit aktivem Pin/Proxy, inklusive `apt-get download` + `dpkg -i`-Fallback und `update-ca-certificates --fresh`
+- Traversierbarkeit von `/etc`/`/etc/ssl` für `_apt` und `tolaria`; explizites apt-CA-Bundle (`Acquire::https::CaInfo`)
+- Offizieller Node-22-Tarball als **primärer** Weg (SHA256-geprüft, nach `/usr/local`, systemd-Unit nutzt den tatsächlichen Pfad); NodeSource nur noch Fallback
+- npm-Registry-Pinning (`registry.npmjs.org`/`registry.npmjs.com`) im selben `/etc/hosts`-Block wie apt, plus `--network-concurrency=4`, `--fetch-retries=8` und Retry für `pnpm install`
 - Vault-Seeding mit explizitem `--git-dir`/`--work-tree` und Bereinigung einer geerbten Git-Umgebung; funktional mit `GIT_DIR=/nonexistent` und dem echten `demo-vault-v2` getestet
 - pnpm/Build ohne Login-Shell, mit absolutem pnpm-Pfad und explizitem `PATH`
 - Dateirechte für Build-Benutzer: `umask 022`, pnpm ausführbar, `/etc/ssl/openssl.cnf` und CA-Bundle lesbar

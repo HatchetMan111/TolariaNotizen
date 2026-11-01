@@ -23,7 +23,7 @@ umask 077
 # ---------------------------------------------------------------------------
 APP="tolaria"
 APP_TITLE="Tolaria"
-INSTALLER_VERSION="2026-10-31.11"
+INSTALLER_VERSION="2026-11-01.1"
 PORT="${PORT:-8080}"                            # nginx / Web-UI
 SERVER_PORT="8787"                              # Tolaria-Server, nur 127.0.0.1
 UPSTREAM_REPO="https://github.com/refactoringhq/tolaria.git"
@@ -197,7 +197,11 @@ on_error() {
       pct exec "${CTID}" -- bash -c 'cat /etc/resolv.conf' 2>&1 || true
       pct exec "${CTID}" -- bash -c 'getent ahostsv4 deb.debian.org || echo "IPv4-Aufloesung fehlgeschlagen"' 2>&1 || true
       pct exec "${CTID}" -- bash -c 'getent ahostsv6 deb.debian.org || echo "IPv6-Aufloesung fehlgeschlagen"' 2>&1 || true
+      pct exec "${CTID}" -- bash -c 'getent ahostsv4 registry.npmjs.org || echo "npm-Registry-Aufloesung fehlgeschlagen"' 2>&1 || true
       pct exec "${CTID}" -- bash -c 'ip -4 route 2>/dev/null; ip -4 addr show dev eth0 2>/dev/null' 2>&1 || true
+      msg_error "--- Pfadrechte im Container (/etc-Traversal, CA, Keyring) ---"
+      pct exec "${CTID}" -- bash -c 'stat -c "%a %U:%G %n" /etc /etc/ssl /etc/ssl/certs /etc/ssl/openssl.cnf /etc/ssl/certs/ca-certificates.crt /usr/share/keyrings /etc/hosts 2>/dev/null' 2>&1 || true
+      pct exec "${CTID}" -- bash -c 'if id -u _apt >/dev/null 2>&1; then runuser -u _apt -- test -r /etc/ssl/certs/ca-certificates.crt && echo "_apt CA-Bundle: lesbar" || echo "_apt CA-Bundle: NICHT lesbar"; runuser -u _apt -- test -r /usr/share/keyrings/debian-archive-keyring.gpg && echo "_apt Keyring: lesbar" || echo "_apt Keyring: NICHT lesbar"; fi' 2>&1 || true
       pct exec "${CTID}" -- bash -c 'if [ -f /etc/dhcp/dhclient.conf ]; then grep -n "tolaria-dns\|domain-name-servers" /etc/dhcp/dhclient.conf || true; fi' 2>&1 || true
       pct exec "${CTID}" -- bash -c 'if [ -f /etc/hosts ]; then grep -A6 -F "# >>> tolaria-apt-hosts >>>" /etc/hosts || true; fi' 2>&1 || true
       pct exec "${CTID}" -- bash -c 'if [ -f /root/tolaria-apt-update.log ]; then tail -n 30 /root/tolaria-apt-update.log || true; fi' 2>&1 || true

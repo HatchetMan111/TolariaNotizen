@@ -14,7 +14,7 @@ umask 022
 export PATH="/usr/local/bin:/usr/local/sbin:${PATH}"
 
 APP="tolaria"
-SETUP_VERSION="2026-10-31.11"
+SETUP_VERSION="2026-11-01.1"
 BUILD_LOG="/root/tolaria-build.log"
 PKG_DIR="/root/tolaria-packaging"
 INSTALL_ENV="${PKG_DIR}/install.env"
@@ -57,8 +57,30 @@ on_error() {
   cat /etc/resolv.conf 2>&1 || true
   getent ahostsv4 deb.debian.org 2>&1 || echo "IPv4-Auflösung fehlgeschlagen"
   getent ahostsv6 deb.debian.org 2>&1 || echo "IPv6-Auflösung fehlgeschlagen"
+  getent ahostsv4 registry.npmjs.org 2>&1 || echo "npm-Registry IPv4-Auflösung fehlgeschlagen"
   ip -4 route 2>&1 || true
   ip -4 addr show dev eth0 2>&1 || true
+  echo ""
+  msg_error "--- Pfadrechte (entscheidend für _apt und tolaria) ---"
+  stat -c '%a %U:%G %n' /etc /etc/ssl /etc/ssl/certs /etc/ssl/openssl.cnf \
+    /etc/ssl/certs/ca-certificates.crt /usr/share/keyrings /etc/hosts 2>&1 || true
+  if id -u _apt >/dev/null 2>&1; then
+    if runuser -u _apt -- test -r /etc/ssl/certs/ca-certificates.crt 2>/dev/null; then
+      msg_error "_apt kann das CA-Bundle lesen: ja"
+    else
+      msg_error "_apt kann das CA-Bundle lesen: NEIN (HTTPS-apt/GPG scheitert)"
+    fi
+    if runuser -u _apt -- test -r /usr/share/keyrings/debian-archive-keyring.gpg 2>/dev/null; then
+      msg_error "_apt kann den Debian-Keyring lesen: ja"
+    else
+      msg_error "_apt kann den Debian-Keyring lesen: NEIN (NO_PUBKEY)"
+    fi
+  fi
+  if runuser -u "$APP" -- test -r /etc/ssl/openssl.cnf 2>/dev/null; then
+    msg_error "${APP} kann openssl.cnf lesen: ja"
+  else
+    msg_error "${APP} kann openssl.cnf lesen: NEIN"
+  fi
   if [[ -f /etc/dhcp/dhclient.conf ]]; then
     grep -n 'tolaria-dns\|domain-name-servers' /etc/dhcp/dhclient.conf 2>&1 || true
   fi
@@ -171,6 +193,58 @@ msg_info "Setup-Version: ${SETUP_VERSION}"
 msg_info "Build-Log: ${BUILD_LOG}"
 
 # ---------------------------------------------------------------------------
+# Systempfade für nicht-root Benutzer traversierbar machen
+# ---------------------------------------------------------------------------
+# In LXC-Containern kann /etc mit Modus 0700 stehen. Die Dateien darin sind
+# zwar 644, aber _apt (apt-Methoden) und der Build-Benutzer tolaria können das
+# Verzeichnis nicht betreten. Folgen aus genau diesem Zustand:
+#   - apt HTTPS: "The certificate issuer is unknown" / "No system certificates"
+#   - apt GPG: _apt kann Keyring/CA-Bundle unter /usr/share/keyrings bzw.
+#     /etc/ssl nicht lesen (NO_PUBKEY wird zusätzlich durch einen veralteten
+#     Keyring verursacht, siehe Keyring-Reparatur weiter unten)
+#   - Build: "tolaria kann /etc/ssl/openssl.cnf nicht lesen"
+# Benötigt wird nur das Ausführungsbit (Traversal), nicht Lesen des Inhalts.
+# Debian setzt /etc normalerweise auf 755; hier wird ausschließlich repariert,
+# wenn das Bit fehlt.
+path_has_other_x() {
+  local dir="$1" mode last
+  mode="$(stat -c '%a' "$dir" 2>/dev/null || echo 755)"
+  last="${mode: -1}"
+  case "$last" in
+    1|3|5|7) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+ensure_traversable() {
+  local dir="$1" mode
+  [[ -d "$dir" ]] || return 0
+  path_has_other_x "$dir" && return 0
+  mode="$(stat -c '%a' "$dir" 2>/dev/null || echo '?')"
+  chmod a+x "$dir" 2>/dev/null || true
+  msg_warn "Verzeichnis ${dir} war nicht traversierbar (${mode}) - Ausführungsbit ergänzt."
+}
+
+ensure_readable() {
+  local file="$1"
+  [[ -f "$file" ]] || return 0
+  chmod a+r "$file" 2>/dev/null || true
+}
+
+harden_system_paths() {
+  local dir file
+  for dir in /etc /etc/ssl /etc/ssl/certs /etc/apt /usr/share/keyrings /usr/lib/ssl; do
+    ensure_traversable "$dir"
+  done
+  for file in /etc/ssl/openssl.cnf /usr/lib/ssl/openssl.cnf /etc/ssl/certs/ca-certificates.crt; do
+    ensure_readable "$file"
+  done
+}
+
+msg_info "Prüfe Zugriffsrechte auf /etc, CA-Bundle und Keyring ..."
+harden_system_paths
+
+# ---------------------------------------------------------------------------
 # DNS prüfen und gegen DHCP-Überschreiben absichern
 # ---------------------------------------------------------------------------
 REPAIR_DNS="${PKG_DIR}/repair-dns.sh"
@@ -220,6 +294,7 @@ Acquire::ForceIPv4 "true";
 Acquire::Retries "5";
 Acquire::http::Timeout "30";
 Acquire::https::Timeout "30";
+Acquire::https::CaInfo "/etc/ssl/certs/ca-certificates.crt";
 Acquire::http::Pipeline-Depth "0";
 Acquire::Queue-Mode "access";
 EOF
@@ -252,7 +327,11 @@ APT_PROXY_PID=""
 APT_PROXY_ACTIVE=0
 APT_HOSTS_BEGIN="# >>> tolaria-apt-hosts >>>"
 APT_HOSTS_END="# <<< tolaria-apt-hosts <<<"
-APT_HOSTS_LIST="deb.debian.org security.debian.org deb.nodesource.com"
+# Neben den apt-Hosts werden auch die npm-Registry-Hosts gepinnt. pnpm startet
+# hunderte parallele Downloads; ein flakiger Resolver scheitert dabei mit
+# EAI_AGAIN, obwohl einzelne getent-Aufrufe funktionieren. /etc/hosts gilt für
+# alle Prozesse (auch tolaria) und macht die Registry von DNS unabhängig.
+APT_HOSTS_LIST="deb.debian.org security.debian.org deb.nodesource.com registry.npmjs.org registry.npmjs.com"
 
 apt_hosts_remove_block() {
   [[ -f "$APT_HOSTS_FILE" ]] || return 0
@@ -382,7 +461,7 @@ pin_apt_hosts() {
   APT_HOSTS_PINNED=0
   ensure_hosts_lookup || msg_warn "Hosts-Pinning läuft ohne garantierte /etc/hosts-Auflösung."
   if [[ -f "$APT_HOSTS_PIN" ]]; then
-    if ! bash "$APT_HOSTS_PIN" pin; then
+    if ! bash "$APT_HOSTS_PIN" pin --hosts "$APT_HOSTS_LIST"; then
       msg_warn "apt-hosts-pin.sh ist fehlgeschlagen - nutze eingebauten Fallback."
       apt_hosts_pin_inline || true
     fi
@@ -392,11 +471,17 @@ pin_apt_hosts() {
   fi
   if apt_hosts_verified; then
     APT_HOSTS_PINNED=1
-    msg_ok "apt-Hosts verifiziert - apt braucht für die Installation kein DNS."
+    msg_ok "apt-/npm-Hosts verifiziert - apt und pnpm brauchen für die Installation kein DNS."
   else
     msg_warn "apt-Hosts konnten nicht verifiziert werden - apt nutzt DNS (anfällig)."
   fi
   (( APT_HOSTS_PINNED ))
+}
+
+# Prüft gezielt den Registry-Pin. Für pnpm ist registry.npmjs.org der Host,
+# von dem alle Tarballs geladen werden.
+npm_registry_pinned() {
+  [[ -f "$APT_HOSTS_FILE" ]] && grep -qE "^[0-9a-fA-F:.]+ registry\.npmjs\.org$" "$APT_HOSTS_FILE"
 }
 
 unpin_apt_hosts() {
@@ -482,7 +567,11 @@ fi
 # wurden ("W: Failed to fetch ... Some index files failed to download").
 # Deshalb wird die Ausgabe geprüft und der Fall explizit behandelt.
 apt_update_once() {
-  apt-get update "${APT_OPTS[@]}" >"$APT_LOG" 2>&1
+  apt-get update "${APT_OPTS[@]}" >"$APT_LOG" 2>&1 || return 1
+  # apt-get update endet auch dann mit 0, wenn ALLE Indexe nicht geladen wurden
+  # ("W: Failed to fetch ... Some index files failed to download"). Ohne diese
+  # Prüfung meldet der Installer "Paketlisten aktualisiert", obwohl sie alt sind.
+  ! apt_log_has_fetch_errors
 }
 
 apt_log_has_fetch_errors() {
@@ -545,17 +634,13 @@ fi
 
 if (( update_ok == 0 )); then
   apt_diag
-  msg_error "apt-get update ist fehlgeschlagen (DNS, Proxy oder Mirror-Problem)."
-  msg_error "Ein oben sichtbarer Pin-Block schließt DNS als Hauptursache weitgehend aus."
-  exit 1
-fi
-
-if apt_log_has_fetch_errors; then
-  msg_warn "apt-get update meldet Fetch-Fehler - prüfe, ob die Pakete trotzdem auflösbar sind ..."
+  msg_warn "apt-get update konnte keine vollständigen Paketlisten laden."
+  # Entscheidend ist, ob die vorhandenen Listen die benötigten Pakete noch
+  # auflösen. Ist das der Fall, wird die Installation fortgesetzt und der
+  # Keyring gleich mit aktivem Pin/Proxy repariert, statt hier abzubrechen.
   if apt-get install -y --simulate --no-install-recommends "${APT_OPTS[@]}" "${APT_PACKAGES[@]}" >/dev/null 2>&1; then
-    msg_warn "Paketauflösung funktioniert trotz Fetch-Warnungen - fahre fort."
+    msg_warn "Vorhandene Listen reichen zur Paketauflösung - fahre fort und repariere den Keyring."
   else
-    apt_diag
     msg_error "Paketlisten unvollständig und Pakete nicht auflösbar."
     msg_error "Prüfe DNS/Proxy/Internet im Container und führe den Installer erneut aus."
     exit 1
@@ -625,7 +710,9 @@ if (( install_ok == 0 )); then
   msg_error "oder ein veraltetes Paket-Index. Details siehe ${APT_LOG}."
   exit 1
 fi
-unpin_apt_hosts
+# Pin und Proxy bleiben absichtlich aktiv: der Debian-Keyring wird gleich
+# repariert und braucht denselben DNS-unabhängigen Downloadweg. Erst nach der
+# Keyring-Reparatur wird entpinnt (siehe unten).
 msg_ok "Systempakete installiert."
 
 # --fix-missing kann fehlende Pakete stillschweigend überspringen. Deshalb
@@ -647,9 +734,32 @@ fi
 # der Keyring unvollständig, scheitert apt mit "No system certificates" bzw.
 # NO_PUBKEY und installiert anschließend das alte Debian-Node statt 22.
 msg_info "Prüfe CA-Bundle und Debian-Keyring ..."
-if ! retry 2 5 apt-get install -y --reinstall --no-install-recommends \
-      "${APT_OPTS[@]}" ca-certificates debian-archive-keyring; then
+
+# Der Keyring ist die Ursache für NO_PUBKEY. Der Reinstall läuft bewusst,
+# solange der Hosts-Pin und der lokale Proxy noch aktiv sind; bei flakigem DNS
+# scheitert sonst genau dieser Download, und alle späteren apt-Updates bleiben
+# auf einem veralteten Keyring sitzen.
+repair_ca_and_keyring() {
+  local deb
+  if retry 3 10 apt-get install -y --reinstall --no-install-recommends \
+       "${APT_OPTS[@]}" ca-certificates debian-archive-keyring; then
+    return 0
+  fi
+  msg_warn "apt-Reinstall fehlgeschlagen - lade debian-archive-keyring direkt über den Pin/Proxy ..."
+  (cd /tmp && retry 3 10 apt-get download "${APT_OPTS[@]}" debian-archive-keyring) || return 1
+  deb="$(ls -1t /tmp/debian-archive-keyring_*.deb 2>/dev/null | head -n1 || true)"
+  [[ -n "$deb" ]] || return 1
+  if dpkg -i "$deb"; then
+    rm -f "$deb"
+    return 0
+  fi
+  rm -f "$deb"
+  return 1
+}
+
+if ! repair_ca_and_keyring; then
   msg_warn "Reinstall von ca-certificates/debian-archive-keyring fehlgeschlagen."
+  msg_warn "apt kann weiterhin NO_PUBKEY melden; der Node-Build läuft trotzdem über den Tarball."
 fi
 if command -v update-ca-certificates >/dev/null 2>&1; then
   update-ca-certificates --fresh >/dev/null 2>&1 \
@@ -666,24 +776,30 @@ fi
 
 # Node/OpenSSL liest /etc/ssl/openssl.cnf. Ein restriktives umask eines
 # früheren Laufs kann die Datei auf 600 gesetzt haben; tolaria darf sie lesen.
-chmod 755 /etc/ssl 2>/dev/null || true
-chmod 755 /etc/ssl/certs 2>/dev/null || true
-chmod 755 /usr/lib/ssl 2>/dev/null || true
-chmod 644 /etc/ssl/openssl.cnf 2>/dev/null || true
-chmod 644 /usr/lib/ssl/openssl.cnf 2>/dev/null || true
-chmod 644 /etc/ssl/certs/ca-certificates.crt 2>/dev/null || true
-if retry 2 5 apt_update_once; then
+# Zusätzlich wird /etc selbst traversierbar gehalten (siehe harden_system_paths).
+ensure_traversable /etc
+ensure_traversable /etc/ssl
+ensure_traversable /etc/ssl/certs
+ensure_traversable /usr/lib/ssl
+ensure_readable /etc/ssl/openssl.cnf
+ensure_readable /usr/lib/ssl/openssl.cnf
+ensure_readable /etc/ssl/certs/ca-certificates.crt
+if retry 3 5 apt_update_once; then
   msg_ok "Paketlisten nach Keyring-Update aktualisiert."
 else
-  msg_warn "apt-get update nach Keyring-Update fehlgeschlagen."
+  msg_warn "apt-get update nach Keyring-Update fehlgeschlagen - prüfe ${APT_LOG}."
 fi
+
+# Erst jetzt: Pin entfernen. Der Proxy bleibt bis zum EXIT-Trap aktiv, damit
+# spätere apt-Aufrufe (NodeSource-Fallback) nicht wieder an DNS hängen.
+unpin_apt_hosts
 
 # ---------------------------------------------------------------------------
 # Node 22.14+ und pnpm 10.33.0
 # ---------------------------------------------------------------------------
-# NodeSource ist der bevorzugte Weg, aber apts HTTPS-Methode kann in
-# Containern an CA-/GPG-Problemen scheitern. Der offizielle Node-Tarball
-# umgeht apt vollständig; curl prüft das Zertifikat gegen das CA-Bundle.
+# Die Installation erfolgt primär über den offiziellen Node-Tarball: kein
+# apt, kein GPG, kein HTTPS-apt und keine NodeSource-Repo-Signatur. NodeSource
+# bleibt nur Fallback, falls nodejs.org nicht erreichbar ist.
 install_node_tarball() {
   local prefix="${NODE_PREFIX:-/usr/local}"
   local base="https://nodejs.org/dist/latest-v22.x"
@@ -696,12 +812,22 @@ install_node_tarball() {
   command -v sha256sum >/dev/null 2>&1 || { msg_error "sha256sum fehlt."; return 1; }
 
   # nodejs.org per IPv4 pinnen, damit auch dieser Download kein DNS braucht.
-  ip="$(getent ahostsv4 nodejs.org 2>/dev/null | awk 'NR==1 {print $1}')"
-  if [[ -z "$ip" ]]; then
-    msg_error "nodejs.org ist nicht per IPv4 auflösbar."
-    return 1
+  # Der Resolver ist in betroffenen Containern flatterhaft; deshalb mehrere
+  # Versuche. Scheitert die Auflösung komplett, darf curl es normal per DNS
+  # versuchen (der Download selbst hat eigene Retries).
+  local attempt
+  ip=""
+  for attempt in 1 2 3 4 5; do
+    ip="$(getent ahostsv4 nodejs.org 2>/dev/null | awk 'NR==1 {print $1}')"
+    [[ -n "$ip" ]] && break
+    (( attempt < 5 )) && sleep 1
+  done
+  if [[ -n "$ip" ]]; then
+    curl_opts=(--resolve "nodejs.org:443:${ip}")
+  else
+    msg_warn "nodejs.org ist nicht per IPv4 auflösbar - nutze den normalen DNS-Weg."
+    curl_opts=()
   fi
-  curl_opts=(--resolve "nodejs.org:443:${ip}")
 
   download_node_file() {
     local url="$1" out="$2" max_time="$3"
@@ -758,34 +884,42 @@ else
 fi
 
 if [[ "$need_node" == "1" ]]; then
-  msg_info "Installiere Node.js 22.x von NodeSource ..."
-  if pin_apt_hosts; then
-    start_apt_proxy || msg_warn "apt-Proxy für NodeSource nicht verfügbar - nutze direkte Verbindungen."
+  # Der offizielle Tarball ist der primäre Weg: kein apt, kein GPG, kein
+  # HTTPS-apt, keine NodeSource-Repo-Signatur. Genau diese Kette ist im
+  # gemeldeten Lauf an NO_PUBKEY und "issuer unknown" gescheitert.
+  msg_info "Installiere Node.js 22.x aus dem offiziellen Tarball ..."
+  if install_node_tarball; then
+    msg_ok "Node.js $(node --version) bereit (Tarball, ohne apt)."
   else
-    msg_warn "NodeSource-Pin nicht verifiziert - nutze DNS."
-  fi
-  # curl (NodeSource-Setup) und das Setup-Skript selbst sollen denselben
-  # lokalen Proxy nutzen wie apt. Sonst hängt der nächste Schritt wieder an DNS.
-  if (( APT_PROXY_ACTIVE )); then
-    export http_proxy="http://127.0.0.1:${APT_PROXY_PORT}"
-    export https_proxy="$http_proxy"
-    export no_proxy="localhost,127.0.0.1"
-  fi
-  if retry 3 5 curl -fsSL --max-time 60 https://deb.nodesource.com/setup_22.x -o /tmp/nodesource_setup.sh; then
-    if bash /tmp/nodesource_setup.sh; then
-      rm -f /tmp/nodesource_setup.sh
-      if ! retry 3 10 apt-get install -y "${APT_OPTS[@]}" nodejs; then
-        msg_warn "NodeSource-apt-Installation fehlgeschlagen - versuche den offiziellen Tarball."
+    msg_warn "Tarball-Installation fehlgeschlagen - versuche NodeSource als Fallback ..."
+    if pin_apt_hosts; then
+      start_apt_proxy || msg_warn "apt-Proxy für NodeSource nicht verfügbar - nutze direkte Verbindungen."
+    else
+      msg_warn "NodeSource-Pin nicht verifiziert - nutze DNS."
+    fi
+    # curl (NodeSource-Setup) und das Setup-Skript selbst sollen denselben
+    # lokalen Proxy nutzen wie apt. Sonst hängt der nächste Schritt wieder an DNS.
+    if (( APT_PROXY_ACTIVE )); then
+      export http_proxy="http://127.0.0.1:${APT_PROXY_PORT}"
+      export https_proxy="$http_proxy"
+      export no_proxy="localhost,127.0.0.1"
+    fi
+    if retry 3 5 curl -fsSL --max-time 60 https://deb.nodesource.com/setup_22.x -o /tmp/nodesource_setup.sh; then
+      if bash /tmp/nodesource_setup.sh; then
+        rm -f /tmp/nodesource_setup.sh
+        if ! retry 3 10 apt-get install -y "${APT_OPTS[@]}" nodejs; then
+          msg_warn "NodeSource-apt-Installation fehlgeschlagen - versuche den offiziellen Tarball erneut."
+        fi
+      else
+        rm -f /tmp/nodesource_setup.sh
+        msg_warn "NodeSource-Setup ist fehlgeschlagen - versuche den offiziellen Tarball erneut."
       fi
     else
-      rm -f /tmp/nodesource_setup.sh
-      msg_warn "NodeSource-Setup ist fehlgeschlagen - versuche den offiziellen Tarball."
+      msg_warn "NodeSource-Setup konnte nicht geladen werden - versuche den offiziellen Tarball erneut."
     fi
-  else
-    msg_warn "NodeSource-Setup konnte nicht geladen werden - versuche den offiziellen Tarball."
+    unset http_proxy https_proxy no_proxy
+    unpin_apt_hosts
   fi
-  unset http_proxy https_proxy no_proxy
-  unpin_apt_hosts
 else
   msg_ok "Node.js $(node --version) bereits vorhanden."
 fi
@@ -813,12 +947,30 @@ if ! command -v npm >/dev/null 2>&1; then
   exit 1
 fi
 msg_info "Installiere pnpm 10.33.0 global ..."
+# Registry vor dem Download pinnen. npm/pnpm öffnen viele parallele
+# Verbindungen; ein Resolver, der einzelne Anfragen beantwortet, scheitert
+# dabei mit EAI_AGAIN. /etc/hosts gilt auch für den Benutzer tolaria.
+if pin_apt_hosts; then
+  if npm_registry_pinned; then
+    msg_ok "npm-Registry gepinnt (registry.npmjs.org)."
+  else
+    msg_warn "registry.npmjs.org konnte nicht gepinnt werden - npm nutzt DNS (anfällig)."
+  fi
+else
+  msg_warn "Host-Pinning nicht verifiziert - npm/pnpm nutzen DNS (anfällig)."
+fi
 # pnpm muss für den Build-Benutzer tolaria lesbar/ausführbar sein.
 # npm mit explizitem umask 022 installieren und die Rechte danach prüfen.
-if ! retry 3 10 bash -c 'umask 022; npm install -g --no-fund --no-audit pnpm@10.33.0'; then
+export NPM_CONFIG_FETCH_RETRIES=8
+export NPM_CONFIG_FETCH_RETRY_MINTIMEOUT=2000
+export NPM_CONFIG_FETCH_RETRY_MAXTIMEOUT=60000
+export NPM_CONFIG_FETCH_TIMEOUT=120000
+if ! retry 3 15 bash -c 'umask 022; npm install -g --no-fund --no-audit pnpm@10.33.0'; then
   msg_error "pnpm konnte nicht über npm installiert werden (Registry erreichbar?)."
   exit 1
 fi
+unset NPM_CONFIG_FETCH_RETRIES NPM_CONFIG_FETCH_RETRY_MINTIMEOUT \
+  NPM_CONFIG_FETCH_RETRY_MAXTIMEOUT NPM_CONFIG_FETCH_TIMEOUT
 pnpm_version="$(pnpm --version)"
 [[ "$pnpm_version" == "10.33.0" ]] || { msg_error "pnpm-Version ist ${pnpm_version}, erwartet 10.33.0"; exit 1; }
 PNPM_BIN="$(command -v pnpm || true)"
@@ -866,7 +1018,7 @@ if [[ -d /opt/tolaria/src/.git ]]; then
   CURRENT_REV="$(git -C /opt/tolaria/src rev-parse HEAD 2>/dev/null || true)"
   msg_info "Aktualisiere Tolaria-Quellcode auf ${UPSTREAM_REF} ..."
   git -C /opt/tolaria/src remote set-url origin "$UPSTREAM_REPO"
-  if ! git -C /opt/tolaria/src fetch --depth 1 origin "$UPSTREAM_REF"; then
+  if ! retry 3 10 git -C /opt/tolaria/src fetch --depth 1 origin "$UPSTREAM_REF"; then
     msg_error "git fetch ist fehlgeschlagen (GitHub erreichbar? DNS/Proxy?)."
     exit 1
   fi
@@ -883,14 +1035,14 @@ if [[ -d /opt/tolaria/src/.git ]]; then
 else
   msg_info "Klone Tolaria (${UPSTREAM_REF}) ..."
   rm -rf /opt/tolaria/src
-  if ! git clone --depth 1 --branch "$UPSTREAM_REF" "$UPSTREAM_REPO" /opt/tolaria/src 2>/dev/null; then
+  if ! retry 3 10 git clone --depth 1 --branch "$UPSTREAM_REF" "$UPSTREAM_REPO" /opt/tolaria/src 2>/dev/null; then
     msg_warn "Direkter Branch/Tag-Clone fehlgeschlagen - versuche Commit/Ref über fetch."
     rm -rf /opt/tolaria/src
-    if ! git clone --depth 1 "$UPSTREAM_REPO" /opt/tolaria/src; then
+    if ! retry 3 10 git clone --depth 1 "$UPSTREAM_REPO" /opt/tolaria/src; then
       msg_error "git clone ist fehlgeschlagen (GitHub erreichbar? DNS/Proxy?)."
       exit 1
     fi
-    git -C /opt/tolaria/src fetch --depth 1 origin "$UPSTREAM_REF"
+    retry 3 10 git -C /opt/tolaria/src fetch --depth 1 origin "$UPSTREAM_REF"
     git -C /opt/tolaria/src checkout -f FETCH_HEAD
   fi
 fi
@@ -928,15 +1080,34 @@ if [[ "$NEED_BUILD" == "1" ]]; then
   fi
 
   msg_info "Installiere pnpm-Abhängigkeiten (kann einige Minuten dauern) ..."
-  if ! runuser -u "$APP" -- env \
-    HOME="/home/$APP" \
-    PATH="/usr/local/bin:/usr/bin:/bin" \
-    OPENSSL_CONF=/dev/null \
-    HUSKY=0 \
-    CI=1 \
-    NODE_OPTIONS="--max-old-space-size=4096" \
-    bash -c "cd /opt/tolaria/src && '${PNPM_BIN}' install --frozen-lockfile"; then
+  if ! npm_registry_pinned; then
+    pin_apt_hosts || msg_warn "Registry-Pin fehlt - pnpm nutzt DNS (anfällig)."
+  fi
+  if npm_registry_pinned; then
+    msg_ok "registry.npmjs.org ist gepinnt - pnpm braucht kein DNS."
+  fi
+
+  # Weniger parallele Verbindungen + mehr Retries: bei einem flakigen
+  # Resolver/NAT ist das der Unterschied zwischen EAI_AGAIN und Erfolg.
+  # Der pnpm-Store bleibt im Home von tolaria erhalten, ein Retry setzt also
+  # bei bereits geladenen Paketen an.
+  pnpm_install_once() {
+    runuser -u "$APP" -- env \
+      HOME="/home/$APP" \
+      PATH="/usr/local/bin:/usr/bin:/bin" \
+      OPENSSL_CONF=/dev/null \
+      HUSKY=0 \
+      CI=1 \
+      NODE_OPTIONS="--max-old-space-size=4096" \
+      bash -c "cd /opt/tolaria/src && '${PNPM_BIN}' install --frozen-lockfile \
+        --network-concurrency=4 --fetch-retries=8 \
+        --fetch-retry-mintimeout=2000 --fetch-retry-maxtimeout=60000 \
+        --fetch-timeout=120000"
+  }
+  if ! retry 3 20 pnpm_install_once; then
     msg_error "pnpm install ist fehlgeschlagen (Registry/Netzwerk oder Lockfile)."
+    msg_error "Prüfen: pct exec ${CTID} -- getent ahostsv4 registry.npmjs.org"
+    msg_error "        pct exec ${CTID} -- grep -A8 tolaria-apt-hosts /etc/hosts"
     exit 1
   fi
 

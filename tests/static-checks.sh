@@ -592,13 +592,37 @@ run "Setup: lokaler apt-Proxy vorhanden" grep -q 'start_apt_proxy' "$CT_SETUP"
 run "Setup: Proxy wird aufgeräumt" grep -q 'cleanup_apt' "$CT_SETUP"
 run "Setup: CA-Bundle wird geprüft" grep -q '/etc/ssl/certs/ca-certificates.crt' "$CT_SETUP"
 run "Setup: Debian-Keyring wird repariert" grep -q 'debian-archive-keyring' "$CT_SETUP"
+run "Setup: /etc wird traversierbar gemacht" grep -q 'ensure_traversable /etc' "$CT_SETUP"
+run "Setup: CA-Bundle fuer _apt lesbar" grep -q 'ensure_readable /etc/ssl/certs/ca-certificates.crt' "$CT_SETUP"
+run "Setup: apt nutzt explizites CA-Bundle" grep -q 'Acquire::https::CaInfo' "$CT_SETUP"
+run "Setup: Keyring-Reparatur mit Download-Fallback" grep -q 'apt-get download' "$CT_SETUP"
+if [[ "$(grep -n 'install_node_tarball;' "$CT_SETUP" | head -n1 | cut -d: -f1)" -lt \
+      "$(grep -n 'nodesource_setup.sh' "$CT_SETUP" | head -n1 | cut -d: -f1)" ]]; then
+  pass "Setup: Node-Tarball ist der primaere Weg"
+else
+  fail "Setup: Node-Tarball ist nicht der primaere Weg"
+fi
+if [[ "$(grep -n '^unpin_apt_hosts$' "$CT_SETUP" | head -n1 | cut -d: -f1)" -gt \
+      "$(grep -n 'repair_ca_and_keyring' "$CT_SETUP" | head -n1 | cut -d: -f1)" ]]; then
+  pass "Setup: Pin bleibt bis nach der Keyring-Reparatur aktiv"
+else
+  fail "Setup: Pin wird zu früh entfernt"
+fi
+run "Setup: npm-Registry wird gepinnt" grep -q 'registry.npmjs.org' "$CT_SETUP"
+run "Setup: npm-Registry-Pin wird geprueft" grep -q 'npm_registry_pinned' "$CT_SETUP"
+run "Setup: pnpm begrenzt Netzwerk-Parallelitaet" grep -q 'network-concurrency=4' "$CT_SETUP"
+run "Setup: pnpm fetch-retries" grep -q 'fetch-retries=8' "$CT_SETUP"
+run "Setup: pnpm install mit Retry" grep -q 'retry 3 20 pnpm_install_once' "$CT_SETUP"
+run "Setup: git clone/fetch mit Retry" grep -q 'retry 3 10 git clone' "$CT_SETUP"
+run "Host: Diagnose Pfadrechte" grep -q 'Pfadrechte im Container' "$HOST_INST"
+run "Host: Diagnose npm-Registry" grep -q 'registry.npmjs.org' "$HOST_INST"
 run "Setup: NodeSource nutzt den Proxy" grep -q 'https_proxy=' "$CT_SETUP"
 run "Setup: Node-Tarball-Fallback vorhanden" grep -q 'install_node_tarball' "$CT_SETUP"
 run "Setup: pnpm wird absolut aufgerufen" grep -q "PNPM_BIN" "$CT_SETUP"
 run "Setup: pnpm mit umask 022 installiert" grep -q 'umask 022; npm install -g' "$CT_SETUP"
 run "Setup: pnpm-Rechte werden korrigiert" grep -q 'chmod -R a+rX' "$CT_SETUP"
 run "Setup: globales umask 022" grep -q '^umask 022$' "$CT_SETUP"
-run "Setup: openssl.cnf wird lesbar gemacht" grep -q 'chmod 644 /etc/ssl/openssl.cnf' "$CT_SETUP"
+run "Setup: openssl.cnf wird lesbar gemacht" grep -q 'ensure_readable /etc/ssl/openssl.cnf' "$CT_SETUP"
 run "Setup: Build nutzt OPENSSL_CONF" grep -q 'OPENSSL_CONF=/dev/null' "$CT_SETUP"
 run "Setup: Pfadrechte werden diagnostiziert" grep -q 'namei -l /etc/ssl/openssl.cnf' "$CT_SETUP"
 run "Setup: Build ohne Login-Shell" grep -q 'bash -c "cd /opt/tolaria/src' "$CT_SETUP"
