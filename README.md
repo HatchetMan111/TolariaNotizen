@@ -41,13 +41,34 @@ bash install/tolaria.sh --ctid 150 --cores 4 --memory 6144 --disk 12
 | Ressourcen | 4 vCPU, 6144 MB RAM, 4096 MB Swap, 12 GB Disk (änderbar) |
 | App | Tolaria Web-Build aus `refactoringhq/tolaria` (`pnpm build:web`) |
 | Server | Tolaria-Sync-Server (Node 22.14+, Port `127.0.0.1:8787`) |
-| Vault | bare Git-Repo `/var/lib/tolaria/vault.git`, geseedet mit `demo-vault-v2` |
+| Vault | bare Git-Repo `/var/lib/tolaria/vault.git`, standardmäßig **leer** (nur `type.md`/`note.md`); Demo per `--demo-vault` |
 | Daten | `/var/lib/tolaria/data` (Arbeits-Clone, Index, Snapshots) |
 | Service | `tolaria.service` (systemd, `Restart=always`) |
 | Proxy | nginx auf Port `8080`, Basic Auth für UI und Web-Config |
 | Secrets | `/etc/tolaria/tolaria.env` (root-only), `/root/tolaria-credentials.txt` |
 
 Der Installer ist **idempotent**: Ein erneuter Lauf mit derselben CT-ID aktualisiert den Quellcode und rebuildet, ohne den Vault zu überschreiben. Vorhandene Tokens und Basic-Auth-Zugangsdaten werden wiederverwendet.
+
+## Vault-Modus
+
+Neue Installationen starten mit einem **leeren Vault**: nur die Typdefinitionen `type.md` und `note.md`, keine Notizen, keine Demo-Inhalte.
+
+```bash
+# leerer Vault (Default)
+bash /tmp/tolaria.sh --ctid 150
+
+# Upstream-Demo-Vault (demo-vault-v2)
+bash /tmp/tolaria.sh --ctid 150 --demo-vault
+
+# vorhandenes Vault ersetzen (Backup mit Zeitstempel)
+bash /tmp/tolaria.sh --ctid 150 --reset-vault
+```
+
+`--reset-vault` stoppt `tolaria`, verschiebt `/var/lib/tolaria/vault.git` und den Arbeits-Clone `/var/lib/tolaria/data/vault` nach `*.bak-<YYYYMMDD-HHMMSS>` und seedet anschließend neu. Der Blob-Store unter `/var/lib/tolaria/data/state` bleibt erhalten. Es wird nichts gelöscht; die Backups können später zurückverschoben werden.
+
+Beim Wechsel von Demo auf leer: `--reset-vault --empty-vault`. Beim Testen der Demo auf einem bestehenden leeren Vault: `--reset-vault --demo-vault`.
+
+> Nach einem Vault-Reset ggf. die Website-Daten im Browser leeren (Strg+F5), weil die Web-App clientseitige Einstellungen hält.
 
 ## Zugriff
 
@@ -153,7 +174,7 @@ Ablauf beim Update:
 2. Ist der Commit unverändert und der Web-Build vorhanden, werden `pnpm install` und `pnpm build:web` **übersprungen** (normale Updates dauern dadurch Sekunden statt 10-25 Minuten).
 3. Bei neuem Commit: `pnpm install --frozen-lockfile`, `pnpm build:web`, Web-Config wird erneut injiziert.
 4. `tolaria.service` und nginx werden neu gestartet.
-5. Vault, Token und Basic-Auth-Passwort bleiben erhalten.
+5. Vault, Token und Basic-Auth-Passwort bleiben erhalten. Nur `--reset-vault` ersetzt den Vault (nach Backup).
 
 Ein Rebuild lässt sich jederzeit erzwingen:
 
@@ -481,6 +502,7 @@ scripts/apt-hosts-pin.sh        apt-Hosts temporär in /etc/hosts pinnen
 scripts/apt-proxy.pl            lokaler apt-Proxy (127.0.0.1:3142) für gepinnte IPs
 scripts/inject-web-config.py    idempotente HTML-Injection
 scripts/seed-vault.sh           bare Git-Vault seeden
+scripts/seed-empty-vault.sh     leeren Vault (nur Typdefinitionen) seeden
 systemd/tolaria.service         systemd-Unit
 nginx/tolaria.conf              nginx-Template (__PORT__, __SERVER_PORT__)
 tests/static-checks.sh          lokale Tests ohne Proxmox
@@ -495,6 +517,8 @@ In dieser Umgebung wurde **kein echter Proxmox-Host** ausgeführt. Validiert wur
 - Bash-Syntax (`bash -n`) und Shellcheck
 - Python-Syntax und idempotente HTML-Injection
 - Vault-Seeding inkl. Idempotenz und Schutz vor Nicht-bare-Verzeichnissen (auch mit dem echten `demo-vault-v2`)
+- Leerer Default-Vault: nur `.gitignore`, `type.md`, `note.md`; keine Notizen, zweiter Lauf überspringt
+- Vault-Modi/Reset statisch geprüft: `--empty-vault`/`--demo-vault`/`--reset-vault`, Default `empty`, Reset-Backups für `vault.git` und Arbeits-Clone
 - nginx-Template-Struktur
 - nginx 1.24 mit dem gerenderten Template lokal: Syntax, Basic-Auth auf `/` und `/tolaria-config.js`, kein Basic-Auth auf `/v1/`, Bearer-Passthrough, gzip/Asset-Caching und öffentliches `/healthz` als Proxy zum Server
 - systemd-Unit (soweit ohne `tolaria`-User/Pfade auf dem Testhost möglich)

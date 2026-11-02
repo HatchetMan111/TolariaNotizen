@@ -14,7 +14,7 @@ umask 022
 export PATH="/usr/local/bin:/usr/local/sbin:${PATH}"
 
 APP="tolaria"
-SETUP_VERSION="2026-11-02.1"
+SETUP_VERSION="2026-11-02.2"
 BUILD_LOG="/root/tolaria-build.log"
 PKG_DIR="/root/tolaria-packaging"
 INSTALL_ENV="${PKG_DIR}/install.env"
@@ -152,6 +152,11 @@ set +a
 CTID="${CTID:-<CTID>}"
 TOLARIA_DNS_SERVERS="${TOLARIA_DNS_SERVERS:-1.1.1.1 9.9.9.9}"
 FORCE_BUILD="${FORCE_BUILD:-0}"
+VAULT_SEED="${VAULT_SEED:-empty}"
+RESET_VAULT="${RESET_VAULT:-0}"
+
+[[ "$VAULT_SEED" == "empty" || "$VAULT_SEED" == "demo" ]] || { msg_error "VAULT_SEED muss 'empty' oder 'demo' sein: $VAULT_SEED"; exit 1; }
+[[ "$RESET_VAULT" =~ ^[01]$ ]] || { msg_error "RESET_VAULT muss 0 oder 1 sein"; exit 1; }
 
 [[ "$PORT" =~ ^[0-9]+$ ]] && (( PORT > 0 && PORT < 65536 )) || { msg_error "PORT ungültig"; exit 1; }
 [[ "$SERVER_PORT" =~ ^[0-9]+$ ]] && (( SERVER_PORT > 0 && SERVER_PORT < 65536 )) || { msg_error "SERVER_PORT ungültig"; exit 1; }
@@ -1061,12 +1066,40 @@ fi
 msg_ok "Quellcode: $(git -C /opt/tolaria/src rev-parse --short HEAD) (${UPSTREAM_REF})"
 
 # ---------------------------------------------------------------------------
-# Git-Vault seeden (nie überschreiben)
+# Git-Vault seeden (leer per Default, Demo optional, Reset nur auf Wunsch)
 # ---------------------------------------------------------------------------
-msg_info "Prüfe/seede Git-Vault /var/lib/tolaria/vault.git ..."
-VAULT_OWNER="$APP" VAULT_GROUP="$APP" \
-  bash "${PKG_DIR}/seed-vault.sh" /var/lib/tolaria/vault.git /opt/tolaria/src/demo-vault-v2
-msg_ok "Git-Vault bereit."
+reset_vault_after_backup() {
+  local stamp="$1" path backup
+  for path in /var/lib/tolaria/vault.git /var/lib/tolaria/data/vault; do
+    [[ -e "$path" ]] || continue
+    backup="${path}.bak-${stamp}"
+    while [[ -e "$backup" ]]; do backup="${backup}-x"; done
+    mv -- "$path" "$backup"
+    msg_ok "Backup: ${backup}"
+  done
+}
+
+if [[ "$RESET_VAULT" == "1" ]]; then
+  if [[ -e /var/lib/tolaria/vault.git || -e /var/lib/tolaria/data/vault ]]; then
+    msg_warn "RESET_VAULT=1: vorhandenes Vault wird ersetzt (Backup mit Zeitstempel)."
+    TOLARIA_RESET_STAMP="$(date +%Y%m%d-%H%M%S)"
+    systemctl stop "$APP" >/dev/null 2>&1 || true
+    reset_vault_after_backup "$TOLARIA_RESET_STAMP"
+    msg_warn "Altes Vault gesichert (.bak-${TOLARIA_RESET_STAMP}); Wiederherstellung: Dienst stoppen, Backups zurückverschieben."
+  else
+    msg_info "RESET_VAULT=1, aber kein vorhandenes Vault gefunden - nichts zu sichern."
+  fi
+fi
+
+msg_info "Prüfe/seede Git-Vault /var/lib/tolaria/vault.git (Modus: ${VAULT_SEED}) ..."
+if [[ "$VAULT_SEED" == "demo" ]]; then
+  VAULT_OWNER="$APP" VAULT_GROUP="$APP" \
+    bash "${PKG_DIR}/seed-vault.sh" /var/lib/tolaria/vault.git /opt/tolaria/src/demo-vault-v2
+else
+  VAULT_OWNER="$APP" VAULT_GROUP="$APP" \
+    bash "${PKG_DIR}/seed-empty-vault.sh" /var/lib/tolaria/vault.git
+fi
+msg_ok "Git-Vault bereit (${VAULT_SEED})."
 
 # ---------------------------------------------------------------------------
 # Build (nur bei neuem Commit, fehlendem Build oder --force-build)

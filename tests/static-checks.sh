@@ -331,6 +331,7 @@ mkdir -p "$PKG_SNAP/scripts" "$PKG_SNAP/systemd" "$PKG_SNAP/nginx"
 cp "$REPO_ROOT/scripts/setup-in-container.sh" "$PKG_SNAP/scripts/"
 cp "$REPO_ROOT/scripts/inject-web-config.py" "$PKG_SNAP/scripts/"
 cp "$REPO_ROOT/scripts/seed-vault.sh" "$PKG_SNAP/scripts/"
+cp "$REPO_ROOT/scripts/seed-empty-vault.sh" "$PKG_SNAP/scripts/"
 cp "$REPO_ROOT/scripts/repair-dns.sh" "$PKG_SNAP/scripts/"
 cp "$REPO_ROOT/scripts/apt-hosts-pin.sh" "$PKG_SNAP/scripts/"
 cp "$REPO_ROOT/scripts/apt-proxy.pl" "$PKG_SNAP/scripts/"
@@ -359,6 +360,7 @@ PACKAGING_FILES=(
   "scripts/setup-in-container.sh"
   "scripts/inject-web-config.py"
   "scripts/seed-vault.sh"
+  "scripts/seed-empty-vault.sh"
   "scripts/repair-dns.sh"
   "scripts/apt-hosts-pin.sh"
   "scripts/apt-proxy.pl"
@@ -461,6 +463,36 @@ if env VAULT_OWNER="$(id -un)" VAULT_GROUP="$(id -gn)" \
   fail "nicht-bare Verzeichnis wird abgelehnt"
 else
   pass "nicht-bare Verzeichnis wird abgelehnt"
+fi
+
+echo ""
+echo "== Leerer Vault (Default) =="
+EMPTY_VAULT="$TMP_DIR/empty-vault.git"
+run "seed leerer Default-Vault" env VAULT_OWNER="$(id -un)" VAULT_GROUP="$(id -gn)" \
+  bash "$REPO_ROOT/scripts/seed-empty-vault.sh" "$EMPTY_VAULT"
+run "leerer Vault: HEAD existiert" git --git-dir="$EMPTY_VAULT" rev-parse --verify HEAD
+EMPTY_FILES="$(git --git-dir="$EMPTY_VAULT" ls-tree --name-only HEAD | sort | tr '\n' ' ')"
+if [[ "$EMPTY_FILES" == ".gitignore note.md type.md " ]]; then
+  pass "leerer Vault: nur .gitignore/note.md/type.md"
+else
+  fail "leerer Vault: unerwartete Dateien: ${EMPTY_FILES:-<leer>}"
+fi
+run "leerer Vault: type.md ist Typdefinition" \
+  bash -c "git --git-dir='$EMPTY_VAULT' show HEAD:type.md | grep -q '^type: Type'"
+run "leerer Vault: note.md ist Typdefinition" \
+  bash -c "git --git-dir='$EMPTY_VAULT' show HEAD:note.md | grep -q '^type: Type'"
+if EMPTY_MD_COUNT="$(git --git-dir="$EMPTY_VAULT" ls-tree -r --name-only HEAD | grep -c '\.md$')" \
+   && [[ "$EMPTY_MD_COUNT" == "2" ]]; then
+  pass "leerer Vault: keine Notizen"
+else
+  fail "leerer Vault: Notizen gefunden (${EMPTY_MD_COUNT:-?} Markdown-Dateien)"
+fi
+SECOND_EMPTY="$(env VAULT_OWNER="$(id -un)" VAULT_GROUP="$(id -gn)" \
+  bash "$REPO_ROOT/scripts/seed-empty-vault.sh" "$EMPTY_VAULT" 2>&1)"
+if grep -q 'bereits geseedet' <<<"$SECOND_EMPTY"; then
+  pass "leerer Vault: zweiter Lauf überspringt"
+else
+  fail "leerer Vault: zweiter Lauf ueberschreibt nicht"
 fi
 
 echo ""
@@ -592,6 +624,18 @@ run "Setup: Dropin deaktiviert PrivateTmp" grep -q '^PrivateTmp=no' "$CT_SETUP"
 run "Setup: randomUUID-Polyfill fuer HTTP-Origins" grep -q 'crypto.randomUUID' "$CT_SETUP"
 run "Setup: Polyfill nutzt getRandomValues" grep -q 'getRandomValues' "$CT_SETUP"
 run "Setup: Polyfill landet vor dem App-Bundle" grep -q 'inject-web-config.py' "$CT_SETUP"
+run "Host: Vault-Default ist leer" grep -q 'VAULT_SEED:-empty' "$HOST_INST"
+run "Host: --empty-vault vorhanden" grep -q -- '--empty-vault' "$HOST_INST"
+run "Host: --demo-vault vorhanden" grep -q -- '--demo-vault' "$HOST_INST"
+run "Host: --reset-vault vorhanden" grep -q -- '--reset-vault' "$HOST_INST"
+run "Host: Vault-Werte in install.env" grep -q "printf 'VAULT_SEED=" "$HOST_INST"
+run "Host: seed-empty-vault.sh im Packaging" grep -q 'scripts/seed-empty-vault.sh' "$HOST_INST"
+run "Setup: Vault-Default ist leer" grep -q 'VAULT_SEED:-empty' "$CT_SETUP"
+run "Setup: Demo nur per Opt-in" grep -q 'VAULT_SEED" == "demo"' "$CT_SETUP"
+run "Setup: leerer Seed wird verwendet" grep -q 'seed-empty-vault.sh' "$CT_SETUP"
+run "Setup: Reset sichert Vault und Arbeits-Clone" grep -q 'reset_vault_after_backup' "$CT_SETUP"
+run "Setup: Reset kennt vault.git" grep -q '/var/lib/tolaria/vault.git' "$CT_SETUP"
+run "Setup: Reset kennt Arbeits-Clone" grep -q '/var/lib/tolaria/data/vault' "$CT_SETUP"
 run "Host: DNS-Erkennung" grep -q 'detect_dns_servers' "$HOST_INST"
 run "Host: Nameserver dauerhaft in CT-Config" grep -Fq 'pct set "$CTID" --nameserver' "$HOST_INST"
 run "Host: persistiert effektive CT-Nameserver" grep -Fq 'CT_DNS_EFFECTIVE' "$HOST_INST"

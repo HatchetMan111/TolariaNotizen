@@ -23,7 +23,7 @@ umask 077
 # ---------------------------------------------------------------------------
 APP="tolaria"
 APP_TITLE="Tolaria"
-INSTALLER_VERSION="2026-11-02.1"
+INSTALLER_VERSION="2026-11-02.2"
 PORT="${PORT:-8080}"                            # nginx / Web-UI
 SERVER_PORT="8787"                              # Tolaria-Server, nur 127.0.0.1
 UPSTREAM_REPO="https://github.com/refactoringhq/tolaria.git"
@@ -56,6 +56,11 @@ AUTH_PASS="${AUTH_PASS:-}"
 DNS_SERVERS="${DNS_SERVERS:-}"                  # optional, z. B. "192.168.1.1 1.1.1.1"
 FALLBACK_DNS_SERVERS="1.1.1.1 9.9.9.9"
 FORCE_BUILD="${FORCE_BUILD:-0}"
+# Vault-Seeding: "empty" = kanonische Minimal-Struktur ohne Notizen (Default),
+# "demo" = Upstream-Demo-Vault (demo-vault-v2). RESET_VAULT=1 ersetzt einen
+# vorhandenen Vault nach Backup; ohne Flag bleibt er unangetastet.
+VAULT_SEED="${VAULT_SEED:-empty}"
+RESET_VAULT="${RESET_VAULT:-0}"
 
 DEBUG="${DEBUG:-0}"
 DRY_RUN=0
@@ -106,6 +111,9 @@ Optionen:
   --ref REF            Upstream-Branch/Tag (Default: ${UPSTREAM_REF})
   --password PW        Root-Passwort des Containers (Default: zufällig)
   --ssh-key PATH       SSH Public Key in den Container übernehmen (optional)
+  --empty-vault        Leeres Vault seeden: nur type.md/note.md, keine Notizen (Default)
+  --demo-vault         Demo-Vault (demo-vault-v2) seeden
+  --reset-vault        Vorhandenes Vault ersetzen (Backup mit Zeitstempel)
   --force-build        Build auch bei unverändertem Upstream-Commit neu ausführen
   --debug, -x          Trace bis zur Secret-Erzeugung + maximale Fehlerkette
   --dry-run            Nur Plan/Argumente ausgeben, nichts verändern
@@ -113,6 +121,8 @@ Optionen:
 
 Umgebung:
   CT_FEATURES                 LXC-Features (Default: nesting=1; "" deaktiviert)
+  VAULT_SEED                  "empty" (Default) oder "demo"
+  RESET_VAULT=1               Vorhandenes Vault nach Backup ersetzen
   TOLARIA_PACKAGING_REF       Branch/Tag/Commit für den Packaging-Tarball (Default: main)
   TOLARIA_PACKAGING_TARBALL   Eigene Tarball-URL oder lokaler Pfad
   TOLARIA_PACKAGING_DIR       Lokaler Checkout statt Download
@@ -269,6 +279,9 @@ while [[ $# -gt 0 ]]; do
     --ref)             REF="${2:?--ref braucht einen Wert}"; shift 2 ;;
     --password)        ROOT_PASSWORD="${2:?--password braucht einen Wert}"; shift 2 ;;
     --ssh-key)         SSH_KEY="${2:?--ssh-key braucht einen Wert}"; shift 2 ;;
+    --empty-vault)     VAULT_SEED="empty"; shift ;;
+    --demo-vault)      VAULT_SEED="demo"; shift ;;
+    --reset-vault)     RESET_VAULT=1; shift ;;
     --force-build)     FORCE_BUILD=1; shift ;;
     --debug|-x)        DEBUG="1"; shift ;;
     --dry-run)         DRY_RUN=1; shift ;;
@@ -291,6 +304,9 @@ fi
 [[ "$REF" =~ ^[A-Za-z0-9._/][A-Za-z0-9._/-]*$ ]] || { msg_error "REF ungültig: $REF"; exit 1; }
 [[ "$PACKAGING_REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { msg_error "TOLARIA_PACKAGING_REF ungültig: $PACKAGING_REF"; exit 1; }
 [[ "$FORCE_BUILD" =~ ^[01]$ ]] || { msg_error "FORCE_BUILD muss 0 oder 1 sein."; exit 1; }
+[[ "$VAULT_SEED" == "empty" || "$VAULT_SEED" == "demo" ]] \
+  || { msg_error "VAULT_SEED muss 'empty' oder 'demo' sein: $VAULT_SEED"; exit 1; }
+[[ "$RESET_VAULT" =~ ^[01]$ ]] || { msg_error "RESET_VAULT muss 0 oder 1 sein."; exit 1; }
 if [[ -n "$DNS_SERVERS" ]]; then
   read -r -a DNS_ARRAY <<< "$DNS_SERVERS"
   (( ${#DNS_ARRAY[@]} <= 3 )) || { msg_error "--dns erlaubt maximal 3 Nameserver."; exit 1; }
@@ -313,6 +329,8 @@ if (( ${#CT_DNS_ARRAY[@]} == 0 )) || [[ "$CT_DNS_VALID" != "1" ]]; then
 fi
 
 if [[ "$DRY_RUN" == "1" ]]; then
+  VAULT_RESET_TEXT=""
+  [[ "$RESET_VAULT" == "1" ]] && VAULT_RESET_TEXT="; Reset mit Backup"
   cat <<EOF
 ${APP_TITLE} - Dry Run (es wird nichts verändert)
 
@@ -327,6 +345,8 @@ ${APP_TITLE} - Dry Run (es wird nichts verändert)
   Nameserver (CT)  : ${CT_DNS}
   Upstream         : ${UPSTREAM_REPO} @ ${REF}
   Basic-Auth-User  : ${AUTH_USER}
+  Vault-Seed       : ${VAULT_SEED} (empty = keine Notizen, demo = Beispieldaten)
+  Vault ersetzen   : ${RESET_VAULT} (1 = Backup + neu seeden)
   Build erzwingen  : ${FORCE_BUILD}
   Installer-Repo   : ${INSTALLER_RAW}
   Installer-Version: ${INSTALLER_VERSION}
@@ -338,7 +358,7 @@ Ablauf:
   3. DNS im CT prüfen und bei Bedarf reparieren (systemd-resolved-Stub)
   4. Node 22 + pnpm 10.33 + nginx + git im CT installieren
   5. Upstream klonen, pnpm install, pnpm build:web (übersprungen, wenn Commit unverändert)
-  6. Vault /var/lib/${APP}/vault.git seeden (demo-vault-v2)
+  6. Vault /var/lib/${APP}/vault.git seeden (${VAULT_SEED}${VAULT_RESET_TEXT})
   7. tolaria.service + nginx + Basic Auth einrichten
   8. Service/HTTP/Proxy verifizieren, URL + Zugang ausgeben
 
@@ -505,6 +525,7 @@ PACKAGING_FILES=(
   "scripts/setup-in-container.sh"
   "scripts/inject-web-config.py"
   "scripts/seed-vault.sh"
+  "scripts/seed-empty-vault.sh"
   "scripts/repair-dns.sh"
   "scripts/apt-hosts-pin.sh"
   "scripts/apt-proxy.pl"
@@ -902,6 +923,8 @@ INSTALL_ENV="$PKG_DIR/install.env"
   printf 'AUTH_PASS=%q\n' "$AUTH_PASS"
   printf 'TOLARIA_DNS_SERVERS=%q\n' "$CT_DNS"
   printf 'FORCE_BUILD=%q\n' "$FORCE_BUILD"
+  printf 'VAULT_SEED=%q\n' "$VAULT_SEED"
+  printf 'RESET_VAULT=%q\n' "$RESET_VAULT"
 } > "$INSTALL_ENV"
 chmod 600 "$INSTALL_ENV"
 
@@ -971,6 +994,7 @@ cat <<EOF
   App          : ${APP_TITLE} - lokale Markdown-Wissensbasis
   Container    : CT ${CTID} (Hostname: ${HOSTNAME_FINAL}, unprivilegiert, onboot=1)
   Features     : ${FEATURES:-keine}
+  Vault        : ${VAULT_SEED} (empty = keine Notizen, demo = Beispieldaten)
   Ressourcen   : ${DEFAULT_CORES} vCPU / ${DEFAULT_RAM} MB RAM / ${DEFAULT_SWAP} MB Swap / ${DEFAULT_DISK} GB Disk
   Web UI       : http://${CONTAINER_IP}:${PORT}
   Login        : Benutzer: ${AUTH_USER}
