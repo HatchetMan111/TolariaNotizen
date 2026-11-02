@@ -23,7 +23,7 @@ umask 077
 # ---------------------------------------------------------------------------
 APP="tolaria"
 APP_TITLE="Tolaria"
-INSTALLER_VERSION="2026-11-01.2"
+INSTALLER_VERSION="2026-11-02.1"
 PORT="${PORT:-8080}"                            # nginx / Web-UI
 SERVER_PORT="8787"                              # Tolaria-Server, nur 127.0.0.1
 UPSTREAM_REPO="https://github.com/refactoringhq/tolaria.git"

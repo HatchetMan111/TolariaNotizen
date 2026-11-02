@@ -14,7 +14,7 @@ umask 022
 export PATH="/usr/local/bin:/usr/local/sbin:${PATH}"
 
 APP="tolaria"
-SETUP_VERSION="2026-11-01.2"
+SETUP_VERSION="2026-11-02.1"
 BUILD_LOG="/root/tolaria-build.log"
 PKG_DIR="/root/tolaria-packaging"
 INSTALL_ENV="${PKG_DIR}/install.env"
@@ -1174,6 +1174,34 @@ import json
 import sys
 
 token = sys.argv[1]
+
+# Tolaria ruft crypto.randomUUID() ohne Feature-Detection auf. Die API gibt es
+# nur in Secure Contexts (HTTPS/localhost); dieser Installer liefert die App
+# bewusst per HTTP im LAN aus. crypto.getRandomValues ist auch dort verfügbar.
+# Upstream vermeidet crypto.subtle aus genau diesem Grund (contentRevision.ts),
+# daher genügt hier ein UUID-v4-Polyfill. In Secure Contexts ist er ein No-op.
+polyfill = r"""
+(function () {
+  if (typeof crypto === "undefined" || typeof crypto.getRandomValues !== "function") return;
+  if (typeof crypto.randomUUID === "function") return;
+  var uuid = function () {
+    var b = crypto.getRandomValues(new Uint8Array(16));
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    var h = Array.prototype.map.call(b, function (x) {
+      return (x + 0x100).toString(16).slice(1);
+    }).join("");
+    return h.slice(0, 8) + "-" + h.slice(8, 12) + "-" + h.slice(12, 16) +
+      "-" + h.slice(16, 20) + "-" + h.slice(20);
+  };
+  try {
+    Object.defineProperty(crypto, "randomUUID", { configurable: true, writable: true, value: uuid });
+  } catch (e) {
+    try { Crypto.prototype.randomUUID = uuid; } catch (e2) {}
+  }
+})();
+"""
+print(polyfill.strip())
 print("window.TOLARIA_REMOTE_URL = window.location.origin;")
 print("window.TOLARIA_REMOTE_TOKEN = " + json.dumps(token) + ";")
 PY

@@ -371,6 +371,25 @@ Der Build-Log liegt im Container unter `/root/tolaria-build.log`:
 pct exec <CTID> -- tail -n 200 /root/tolaria-build.log
 ```
 
+### Render-Fehler: `TypeError: crypto.randomUUID is not a function`
+
+Symptom: Die Seite lädt, aber React bricht beim Rendern ab, z. B.:
+
+```
+TypeError: crypto.randomUUID is not a function
+    at http://<LXC-IP>:8080/assets/App-*.js:...
+```
+
+Ursache: `crypto.randomUUID()` gibt es im Browser nur in einem *Secure Context* (HTTPS oder `localhost`). Tolaria ruft die API beim Laden ohne Feature-Detection auf, der Installer liefert die App aber bewusst per HTTP im LAN aus (`http://<LXC-IP>:8080`).
+
+Der Installer schreibt deshalb einen UUID-v4-Polyfill in `/etc/tolaria/tolaria-config.js`; die Datei wird vor dem App-Bundle geladen und ist in HTTPS-Kontexten ein No-op. Prüfen:
+
+```bash
+pct exec <CTID> -- grep -c 'randomUUID' /etc/tolaria/tolaria-config.js
+```
+
+Kommt `0` zurück, ist der Container noch auf einem alten Installer-Stand: Einzeiler erneut ausführen, danach den Browser hart neu laden (Strg+F5).
+
 ### Service startet nicht: `status=226/NAMESPACE` / `Failed to set up mount namespacing`
 
 Symptom:
@@ -479,6 +498,7 @@ In dieser Umgebung wurde **kein echter Proxmox-Host** ausgeführt. Validiert wur
 - nginx-Template-Struktur
 - nginx 1.24 mit dem gerenderten Template lokal: Syntax, Basic-Auth auf `/` und `/tolaria-config.js`, kein Basic-Auth auf `/v1/`, Bearer-Passthrough, gzip/Asset-Caching und öffentliches `/healthz` als Proxy zum Server
 - systemd-Unit (soweit ohne `tolaria`-User/Pfade auf dem Testhost möglich)
+- `crypto.randomUUID`-Polyfill für LAN-HTTP (Secure-Context-API fehlt auf `http://<IP>`; Polyfill ist unter HTTPS ein No-op)
 - `226/NAMESPACE`-Absicherung: `nesting=1` als LXC-Default (auch für bestehende Container + Neustart), automatischer Namespace-Drop-in-Fallback und explizite Host-Diagnose
 - Automatische Wiederverwendung eines vorhandenen Containers über den Hostnamen; bei Mehrdeutigkeit bewusster Abbruch statt falschem Ziel
 - Installer `--dry-run`, `--help` und Secret-Redaction
